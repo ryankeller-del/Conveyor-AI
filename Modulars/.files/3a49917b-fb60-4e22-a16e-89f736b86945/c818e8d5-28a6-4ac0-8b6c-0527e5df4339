@@ -1,0 +1,13 @@
+```csharp
+using UnityEngine;
+
+public static class FactoryHeartbeat
+{
+    private const string TIME_FORMAT = "yyyy-MM-dd HH:mm:ss"; // Cache format string
+
+    public static void LogHeartbeat()
+    {
+        Debug.Log($"Factory is Online! {DateTime.UtcNow.ToString(TIME_FORMAT)} UTC");
+    }
+}
+```

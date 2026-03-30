@@ -135,6 +135,10 @@ class RunConfig:
     mismatch_overlap_threshold: float = 0.08
     rosetta_enabled: bool = True
     rosetta_max_chars: int = 320
+    skill_evolution_enabled: bool = True
+    skill_min_evidence_count: int = 3
+    skill_negative_delta_threshold: float = -0.08
+    skill_retool_cooldown_waves: int = 2
 
 
 @dataclass
@@ -194,3 +198,6 @@ class RunSnapshot:
     latest_handoff_brief: str = ""
     rosetta_warning_count: int = 0
     latest_rosetta_warning: str = ""
+    active_skill_count: int = 0
+    skill_retool_count: int = 0
+    latest_skill_event: str = ""

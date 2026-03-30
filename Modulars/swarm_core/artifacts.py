@@ -23,6 +23,7 @@ class ArtifactStore:
         self.prompt_guard_path = os.path.join(self.base_dir, "prompt_guard.md")
         self.memory_primitives_path = os.path.join(self.base_dir, "memory_primitives.md")
         self.memory_formats_path = os.path.join(self.base_dir, "memory_formats.json")
+        self.skill_report_path = os.path.join(self.base_dir, "skill_evolution.md")
         self.eff_json_path = os.path.join(self.base_dir, "efficiency_report.json")
         self.eff_md_path = os.path.join(self.base_dir, "efficiency_report.md")
         self.state_path = os.path.join(self.base_dir, "session_state.json")
@@ -182,6 +183,23 @@ class ArtifactStore:
         }
         with open(self.memory_formats_path, "w", encoding="utf-8") as handle:
             json.dump(data, handle, indent=2)
+
+    def append_skill_event(
+        self,
+        action: str,
+        skill_name: str,
+        reason: str,
+        impact_delta: float,
+    ) -> None:
+        lines = [
+            f"## {action} {skill_name}",
+            "",
+            f"Reason: {reason}",
+            f"Impact Delta: {impact_delta:.4f}",
+            "",
+        ]
+        with open(self.skill_report_path, "a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
 
     def write_efficiency_reports(
         self,

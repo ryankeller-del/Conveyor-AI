@@ -210,6 +210,7 @@ def status_swarm():
 
 if __name__ == "__main__":
     try:
-        app.run(host="localhost", port=8001, debug=True)
+        port = int(os.getenv("PORT", "8001"))
+        app.run(host="localhost", port=port, debug=True)
     except Exception as exc:
         print(f"An error occurred: {exc}")

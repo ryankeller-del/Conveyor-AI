@@ -18,6 +18,7 @@ from .failure_memory import FailureMemory
 from .hallucination_guard import HallucinationGuard
 from .prompt_guard import PromptGuard
 from .rosetta import RosettaStone
+from .skill_evolution import SkillEvolutionManager
 from .spawn import AgentDescriptor, AgentRegistry, SpawnManager
 from .stability_guard import GuardDecision, StabilityGuard
 from .team_collab import BrainstormEngine, TeamComparator
@@ -48,6 +49,7 @@ class SwarmController:
         self.root_dir = root_dir
         self.prompt_guard = PromptGuard(guard_agent=context_guard_agent)
         self.rosetta = RosettaStone()
+        self.skill_evolution = SkillEvolutionManager()
         self.test_bot = TestBot(test_agent, prompt_guard=self.prompt_guard)
         self.coder_agent = coder_agent
         self.judge_bot = JudgeBot(judge_agent)
@@ -105,6 +107,7 @@ class SwarmController:
         self.latest_handoff_brief = ""
         self.rosetta_warning_count = 0
         self.latest_rosetta_warning = ""
+        self.latest_skill_event = ""
         self.artifacts: Optional[ArtifactStore] = None
 
     def _wave_name(self, idx: int) -> str:
@@ -147,6 +150,7 @@ class SwarmController:
             self.latest_handoff_brief = ""
             self.rosetta_warning_count = 0
             self.latest_rosetta_warning = ""
+            self.latest_skill_event = ""
             self._pause_event.set()
             self.artifacts.append_progress("Run started")
             self.artifacts.append_event("run_started", {"goal": asdict(goal), "config": asdict(run_config)})
@@ -208,6 +212,9 @@ class SwarmController:
         self.snapshot.latest_handoff_brief = self.latest_handoff_brief[:280]
         self.snapshot.rosetta_warning_count = self.rosetta_warning_count
         self.snapshot.latest_rosetta_warning = self.latest_rosetta_warning[:300]
+        self.snapshot.active_skill_count = len(self.skill_evolution.active_skills)
+        self.snapshot.skill_retool_count = self.skill_evolution.retool_count
+        self.snapshot.latest_skill_event = self.latest_skill_event[:280]
         if self.artifacts:
             self.artifacts.save_snapshot(self.snapshot)
 
@@ -362,6 +369,7 @@ class SwarmController:
                 )
                 if self._apply_guard_decision(decision, config):
                     return
+                self._evaluate_skill_evolution(metric=metric, config=config)
                 self._adapt_compaction_policy(config, metric)
                 self._refresh_user_guidance(config)
                 efficiency_details.append(
@@ -902,6 +910,7 @@ class SwarmController:
             self.handoff_feedback_log.append(note)
             if self._is_handoff_mismatch(payload, failure_output, fix_list, cfg):
                 self.handoff_mismatch_count += 1
+                self.skill_evolution.observe_pattern("handoff_mismatch")
                 learn = (
                     f"Handoff mismatch detected for {agent}. Reassign narrower task scope "
                     f"with explicit file and failing behavior."
@@ -974,6 +983,44 @@ class SwarmController:
         self.open_handoffs = {}
         with self._lock:
             self._save_state()
+
+    def _evaluate_skill_evolution(self, metric: RunMetrics, config: RunConfig) -> None:
+        if self.snapshot.consecutive_failed_waves >= 2:
+            self.skill_evolution.observe_pattern("failure_recurrence")
+        if self.snapshot.no_gain_waves >= 2:
+            self.skill_evolution.observe_pattern("coverage_plateau")
+        if self.snapshot.open_handoff_count >= 2:
+            self.skill_evolution.observe_pattern("handoff_debt")
+        if self.rosetta_warning_count >= 2:
+            self.skill_evolution.observe_pattern("prompt_translation")
+
+        event = self.skill_evolution.evaluate(
+            snapshot=self.snapshot,
+            metric=metric,
+            config=config,
+        )
+        if not event:
+            return
+        self.latest_skill_event = f"{event.action} {event.skill_name}: {event.reason}"
+        if self.artifacts:
+            self.artifacts.append_event(
+                "skill_evolution",
+                {
+                    "action": event.action,
+                    "skill_name": event.skill_name,
+                    "reason": event.reason,
+                    "impact_delta": event.impact_delta,
+                    "active_skill_count": len(self.skill_evolution.active_skills),
+                },
+            )
+            self.artifacts.append_skill_event(
+                action=event.action,
+                skill_name=event.skill_name,
+                reason=event.reason,
+                impact_delta=event.impact_delta,
+            )
+            self.artifacts.append_progress(self.latest_skill_event)
+        self._save_state()
 
     def _apply_fix_pass(self, goal: TaskGoal, fix_list: str) -> None:
         target_path = os.path.join(self.root_dir, goal.target_files[0])

@@ -6,6 +6,7 @@ from swarm_core.compaction import DistillationLoop
 from swarm_core.controller import SwarmController
 from swarm_core.efficiency import EfficiencyAnalyzer
 from swarm_core.rosetta import RosettaStone
+from swarm_core.skill_evolution import SkillEvolutionManager
 from swarm_core.spawn import AgentDescriptor, AgentRegistry, SpawnManager
 from swarm_core.stability_guard import StabilityGuard
 from swarm_core.team_collab import BrainstormEngine, TeamComparator
@@ -183,6 +184,9 @@ def test_controller_status_has_wave_topology_and_recommendation(tmp_path: Path):
     assert "latest_handoff_brief" in status
     assert "rosetta_warning_count" in status
     assert "latest_rosetta_warning" in status
+    assert "active_skill_count" in status
+    assert "skill_retool_count" in status
+    assert "latest_skill_event" in status
 
 
 def test_team_comparison_and_brainstorm_detects_novel_signatures(tmp_path: Path):
@@ -452,3 +456,36 @@ def test_rosetta_flags_vague_or_impossible_requests():
     )
     assert result.warnings
     assert "Objective:" in result.text
+
+
+def test_skill_evolution_promotes_and_retools():
+    manager = SkillEvolutionManager()
+    for _ in range(3):
+        manager.observe_pattern("handoff_mismatch")
+
+    snap = type("S", (), {"wave_index": 3})()
+    cfg = RunConfig(skill_min_evidence_count=3, skill_negative_delta_threshold=-0.05)
+    metric = RunMetrics(
+        cycle_index=3,
+        duration_seconds=2.0,
+        pass_rate=0.9,
+        retries_per_test=0.4,
+        token_or_call_usage=5,
+        failure_recurrence=0,
+        diff_churn=4,
+    )
+    event = manager.evaluate(snapshot=snap, metric=metric, config=cfg)
+    assert event is not None and event.action == "PROMOTE"
+
+    snap2 = type("S", (), {"wave_index": 6})()
+    metric2 = RunMetrics(
+        cycle_index=6,
+        duration_seconds=2.4,
+        pass_rate=0.7,
+        retries_per_test=1.2,
+        token_or_call_usage=9,
+        failure_recurrence=2,
+        diff_churn=12,
+    )
+    event2 = manager.evaluate(snapshot=snap2, metric=metric2, config=cfg)
+    assert event2 is not None and event2.action == "RETOOL"

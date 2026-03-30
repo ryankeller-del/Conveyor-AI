@@ -1,4 +1,5 @@
 import os
+import socket
 from typing import Any, Dict
 
 from dotenv import load_dotenv
@@ -19,6 +20,14 @@ def _make_openai_client(base_url: str, api_key: str) -> OpenAI:
     return OpenAI(base_url=base_url, api_key=api_key)
 
 
+def _is_local_llm_available(host: str = "127.0.0.1", port: int = 11434, timeout: float = 0.5) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def _build_controller() -> SwarmController:
     profiles = build_swarm_profiles()
 
@@ -26,10 +35,15 @@ def _build_controller() -> SwarmController:
         "https://api.groq.com/openai/v1",
         os.getenv("GROQ_API_KEY", ""),
     )
+    openrouter_client = _make_openai_client(
+        "https://openrouter.ai/api/v1",
+        os.getenv("OPENROUTER_API_KEY", ""),
+    )
     local_client = _make_openai_client(
         "http://localhost:11434/v1",
         "ollama",
     )
+    local_available = _is_local_llm_available()
 
     test_agent = SimpleAgent(
         name=profiles["test"].name,
@@ -42,8 +56,10 @@ def _build_controller() -> SwarmController:
         name=profiles["coder"].name,
         model=profiles["coder"].model,
         fallback_models=profiles["coder"].fallback_models,
+        fallback_client_models=["openrouter/free"],
         system_prompt=profiles["coder"].system_prompt,
-        client=local_client,
+        client=local_client if local_available else None,
+        fallback_client=openrouter_client,
     )
     judge_agent = SimpleAgent(
         name=profiles["judge"].name,
@@ -52,12 +68,52 @@ def _build_controller() -> SwarmController:
         system_prompt=profiles["judge"].system_prompt,
         client=local_client,
     )
+    context_guard_agent = SimpleAgent(
+        name=profiles["context_guard"].name,
+        model=profiles["context_guard"].model,
+        fallback_models=profiles["context_guard"].fallback_models,
+        system_prompt=profiles["context_guard"].system_prompt,
+        client=local_client if local_available else None,
+    )
+    pattern_agent = SimpleAgent(
+        name=profiles["pattern_finder"].name,
+        model=profiles["pattern_finder"].model,
+        fallback_models=profiles["pattern_finder"].fallback_models,
+        system_prompt=profiles["pattern_finder"].system_prompt,
+        client=local_client if local_available else None,
+    )
+    compression_agent = SimpleAgent(
+        name=profiles["compression"].name,
+        model=profiles["compression"].model,
+        fallback_models=profiles["compression"].fallback_models,
+        system_prompt=profiles["compression"].system_prompt,
+        client=local_client if local_available else None,
+    )
+    novelty_agent = SimpleAgent(
+        name=profiles["novelty"].name,
+        model=profiles["novelty"].model,
+        fallback_models=profiles["novelty"].fallback_models,
+        system_prompt=profiles["novelty"].system_prompt,
+        client=local_client if local_available else None,
+    )
+    stability_guard_agent = SimpleAgent(
+        name=profiles["stability_guard"].name,
+        model=profiles["stability_guard"].model,
+        fallback_models=profiles["stability_guard"].fallback_models,
+        system_prompt=profiles["stability_guard"].system_prompt,
+        client=local_client if local_available else None,
+    )
 
     return SwarmController(
         test_agent=test_agent,
         coder_agent=coder_agent,
         judge_agent=judge_agent,
-        root_dir=os.getcwd(),
+        root_dir=os.path.dirname(os.path.abspath(__file__)),
+        context_guard_agent=context_guard_agent,
+        pattern_agent=pattern_agent,
+        compression_agent=compression_agent,
+        novelty_agent=novelty_agent,
+        stability_guard_agent=stability_guard_agent,
     )
 
 

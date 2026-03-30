@@ -18,6 +18,7 @@ class RunState(str, Enum):
 class ControllerPhase(str, Enum):
     TEST_WAVE_GEN = "TEST_WAVE_GEN"
     IMPLEMENT = "IMPLEMENT"
+    HALLUCINATION_GUARD = "HALLUCINATION_GUARD"
     JUDGE = "JUDGE"
     WAVE_PROMOTION = "WAVE_PROMOTION"
     TOPOLOGY_REVIEW = "TOPOLOGY_REVIEW"
@@ -32,6 +33,7 @@ class TaskGoal:
 
 @dataclass
 class TestSpec:
+    __test__ = False
     name: str
     wave: str
     content: str
@@ -50,6 +52,9 @@ class SpawnRecord:
     duration_seconds: float
     quality_delta: float
     calls_used: int
+    handoff_id: str = ""
+    return_required: bool = True
+    status: str = "OPEN"
 
 
 @dataclass
@@ -62,6 +67,9 @@ class RunConfig:
     dynamic_spawning_enabled: bool = True
     max_concurrent_agents: int = 5
     spawn_policy: str = "balanced"
+    spawn_planning_enabled: bool = True
+    spawn_min_benefit_score: float = 0.25
+    spawn_cooldown_cycles: int = 1
     topology_candidates: List[List[str]] = field(
         default_factory=lambda: [
             ["TestBot", "LocalCoder", "JudgeBot"],
@@ -86,6 +94,47 @@ class RunConfig:
     brainstorm_top_n: int = 3
     failure_memory_enabled: bool = True
     failure_memory_limit: int = 3
+    hallucination_guard_enabled: bool = True
+    hallucination_alert_threshold: float = 0.6
+    hallucination_block_threshold: float = 0.35
+    doc_grounding_enabled: bool = False
+    prompt_guard_enabled: bool = True
+    prompt_guard_max_chars: int = 6000
+    prompt_guard_complexity_threshold: float = 0.72
+    prompt_guard_retry_on_error: bool = True
+    memory_distillation_enabled: bool = True
+    compaction_interval_waves: int = 5
+    adaptive_compaction_enabled: bool = True
+    min_compaction_interval_waves: int = 2
+    max_compaction_interval_waves: int = 8
+    memory_rule_limit: int = 6
+    memory_breadcrumb_limit: int = 5
+    directive_mode_enabled: bool = True
+    max_problem_scope_chars: int = 1200
+    enforce_no_duplicate_code: bool = True
+    testing_agents_exempt_from_directives: bool = True
+    spin_off_tests_to_ecosystems: bool = True
+    min_passed_tests_for_success: int = 1
+    require_zero_open_handoffs_for_success: bool = True
+    max_consecutive_failed_waves: int = 8
+    ramp_enabled: bool = True
+    ramp_step_waves: int = 3
+    ramp_max_level: int = 2
+    stability_guard_enabled: bool = True
+    guard_max_open_handoffs: int = 6
+    guard_halt_failed_waves: int = 8
+    guard_spawn_pause_waves: int = 2
+    guard_no_gain_redirect: int = 4
+    guard_retry_pressure_threshold: float = 1.4
+    population_control_enabled: bool = True
+    specialist_prune_grace_waves: int = 3
+    need_to_know_enabled: bool = True
+    handoff_brief_max_chars: int = 320
+    handoff_feedback_max_chars: int = 260
+    mismatch_learning_enabled: bool = True
+    mismatch_overlap_threshold: float = 0.08
+    rosetta_enabled: bool = True
+    rosetta_max_chars: int = 320
 
 
 @dataclass
@@ -118,3 +167,30 @@ class RunSnapshot:
     team_ideas_count: int = 0
     latest_brainstorm_summary: str = ""
     failure_memory_hits: int = 0
+    hallucination_confidence: float = 1.0
+    hallucination_alert_count: int = 0
+    latest_hallucination_alert: str = ""
+    prompt_refactor_count: int = 0
+    latest_prompt_guard_note: str = ""
+    compaction_runs: int = 0
+    active_memory_format: str = "NARRATIVE"
+    latest_memory_winner: str = ""
+    latest_breadcrumb: str = ""
+    compaction_interval_active: int = 5
+    ui_suggestions: List[str] = field(default_factory=list)
+    ui_warnings: List[str] = field(default_factory=list)
+    directives_active: bool = True
+    unfinished_feature_count: int = 0
+    current_focus: str = ""
+    open_handoff_count: int = 0
+    latest_handoff_feedback: str = ""
+    consecutive_failed_waves: int = 0
+    ramp_level: int = 0
+    guard_mode: str = "NORMAL"
+    guard_interventions: int = 0
+    latest_guard_action: str = ""
+    latest_guard_reason: str = ""
+    handoff_mismatch_count: int = 0
+    latest_handoff_brief: str = ""
+    rosetta_warning_count: int = 0
+    latest_rosetta_warning: str = ""

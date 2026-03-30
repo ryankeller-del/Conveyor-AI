@@ -1,4 +1,5 @@
 import os
+import socket
 import sys
 
 import chainlit as cl
@@ -27,8 +28,17 @@ groq_client = OpenAI(
 local_client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
 
 
+def _is_local_llm_available(host: str = "127.0.0.1", port: int = 11434, timeout: float = 0.5) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 @cl.on_chat_start
 async def start():
+    local_available = _is_local_llm_available()
     scout = Agent(
         name="ScoutBot",
         client=groq_client,
@@ -57,8 +67,9 @@ async def start():
 
     writer = Agent(
         name="LocalCoder",
-        client=local_client,
-        model="qwen2.5-coder:14b",
+        client=local_client if local_available else openrouter_client,
+        model="qwen2.5-coder:14b" if local_available else "openrouter/free",
+        fallback_models=[] if local_available else ["meta-llama/llama-3.1-8b-instruct:free"],
         system_prompt=(
             "High-Performance Qwen 2.5-Coder (14b). "
             "Output ONLY clean, efficient, production-ready code. "
@@ -76,7 +87,12 @@ async def start():
     )
 
     belt = ContextBelt(max_size=5, compactor_agent=compactor)
-    manager = Orchestrator(belt=belt, loader_agent=loader, local_writer_agent=writer)
+    manager = Orchestrator(
+        belt=belt,
+        loader_agent=loader,
+        local_writer_agent=writer,
+        output_root=os.path.dirname(os.path.abspath(__file__)),
+    )
 
     manager.reindex_active_agents([scout, loader, writer, compactor])
 

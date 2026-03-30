@@ -159,12 +159,13 @@ class ContextBelt:
 # 3. The Orchestrator Class (The Manager)
 # ==========================================
 class Orchestrator:
-    def __init__(self, belt, loader_agent, local_writer_agent):
+    def __init__(self, belt, loader_agent, local_writer_agent, output_root=None):
         self.belt = belt
         self.loader = loader_agent
         self.writer = local_writer_agent
         self.agent_index = {}
         self.last_reindex_epoch = None
+        self.output_root = output_root or os.path.dirname(os.path.abspath(__file__))
 
     def reindex_active_agents(self, agents):
         self.agent_index = {
@@ -194,7 +195,7 @@ class Orchestrator:
         )
 
         target_path = (
-            filename if os.path.isabs(filename) else os.path.join(os.getcwd(), filename)
+            filename if os.path.isabs(filename) else os.path.join(self.output_root, filename)
         )
         os.makedirs(os.path.dirname(target_path), exist_ok=True)
 

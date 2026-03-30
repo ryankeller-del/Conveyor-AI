@@ -18,15 +18,35 @@ class SimpleAgent:
     client: object = None
     model: str = ""
     fallback_models: List[str] = None
+    fallback_client: object = None
+    fallback_client_models: List[str] = None
 
     def generate(self, prompt: str) -> str:
-        if self.client is None:
-            return ""
-
-        models = [self.model] + list(self.fallback_models or [])
-        for model in models:
+        primary_models = [self.model] + list(self.fallback_models or [])
+        for model in primary_models:
             try:
+                if self.client is None:
+                    raise RuntimeError("Primary client unavailable")
                 response = self.client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": prompt},
+                    ],
+                    user=self.name,
+                )
+                content = response.choices[0].message.content
+                if content:
+                    return content
+            except Exception:
+                continue
+
+        fallback_models = list(self.fallback_client_models or [])
+        for model in fallback_models:
+            try:
+                if self.fallback_client is None:
+                    raise RuntimeError("Fallback client unavailable")
+                response = self.fallback_client.chat.completions.create(
                     model=model,
                     messages=[
                         {"role": "system", "content": self.system_prompt},
@@ -43,8 +63,9 @@ class SimpleAgent:
 
 
 class TestBot:
-    def __init__(self, agent: SimpleAgent):
+    def __init__(self, agent: SimpleAgent, prompt_guard=None):
         self.agent = agent
+        self.prompt_guard = prompt_guard
 
     def generate_next_wave(
         self,
@@ -60,6 +81,14 @@ class TestBot:
             "Prioritize boundary conditions, untested branches, error handling, and regressions. "
             f"Coverage gaps: {coverage_gaps}. Previous failures: {previous_results}."
         )
+        if self.prompt_guard:
+            result = self.prompt_guard.guard_prompt(
+                prompt=prompt,
+                purpose="test-generation",
+                max_chars=3500,
+                complexity_threshold=0.72,
+            )
+            prompt = result.prompt
         raw = self.agent.generate(prompt)
 
         parsed_specs = self._parse_specs(raw)

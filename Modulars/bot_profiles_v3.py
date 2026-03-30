@@ -100,4 +100,47 @@ def build_swarm_profiles() -> Dict[str, BotProfile]:
                 "Summarize test failures into specific fix steps and likely root cause."
             ),
         ),
+        "context_guard": BotProfile(
+            name="ContextGuardBot",
+            model="qwen2.5-coder:14b",
+            fallback_models=[],
+            system_prompt=(
+                "You are a high-level prompt strategist. "
+                "Refactor complex prompts into concise, staged, low-ambiguity instructions. "
+                "When failure context is provided, prioritize preventing repeated mistakes."
+            ),
+        ),
+        "pattern_finder": BotProfile(
+            name="PatternFinder",
+            model="qwen2.5-coder:14b",
+            fallback_models=[],
+            system_prompt=(
+                "Analyze failures and progress logs, then extract compact recurring engineering rules."
+            ),
+        ),
+        "compression": BotProfile(
+            name="CompressionBot",
+            model="qwen2.5-coder:14b",
+            fallback_models=[],
+            system_prompt=(
+                "Compress context into high-signal memory with minimal token overhead."
+            ),
+        ),
+        "novelty": BotProfile(
+            name="NoveltyBot",
+            model="qwen2.5-coder:14b",
+            fallback_models=[],
+            system_prompt=(
+                "Propose novel but practical architecture or prompt breadcrumbs to avoid stagnation."
+            ),
+        ),
+        "stability_guard": BotProfile(
+            name="StabilityGuardBot",
+            model="qwen2.5-coder:14b",
+            fallback_models=[],
+            system_prompt=(
+                "You are a swarm stability controller. Detect collapse trends and return concise "
+                "stabilization objectives that reduce retries, open handoffs, and agent churn."
+            ),
+        ),
     }

@@ -1,0 +1,32 @@
+```csharp
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading.Tasks;
+
+public class ScoutBot
+{
+    public async Task<string> DiscoverEnvironment()
+    {
+        // ScoutBot looks at the files in the current directory
+        List<string> files = Directory.GetFiles(".");
+        HashSet<string> fileExtensions = new HashSet<string>();
+
+        foreach (string file in files)
+        {
+            if (File.Exists(file))
+            {
+                string extension = Path.GetExtension(file).ToLower();
+                fileExtensions.Add(extension);
+            }
+        }
+
+        // Simple logic to determine the 'Stack'
+        if (fileExtensions.Contains(".cs")) return "Unity/C# Project";
+        if (fileExtensions.Contains(".py")) return "Python/Backend Project";
+        if (fileExtensions.Contains(".js") || fileExtensions.Contains(".html")) return "Web/Frontend Project";
+
+        return "Unknown/General Coding";
+    }
+}
+```

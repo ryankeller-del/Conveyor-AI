@@ -23,7 +23,7 @@ def build_profiles(stack: str) -> Dict[str, BotProfile]:
 
     loader_prompt = (
         "You are LoaderBot, a deep-dive technical data harvester. "
-        "Prioritize official docs, Unity 6 specifics, and runnable code examples. "
+        "Prioritize official docs, runnable code examples, and implementation details. "
         "Return compact implementation facts for engineers."
     )
 
@@ -31,7 +31,7 @@ def build_profiles(stack: str) -> Dict[str, BotProfile]:
         f"You are LocalCoder for {stack}. "
         "Output only production-ready code with robust error handling. "
         "No markdown fences. "
-        "Follow PEP8 for Python and standard C# conventions for C#."
+        "Follow the dominant conventions already present in the project."
     )
 
     compactor_prompt = (
@@ -68,5 +68,36 @@ def build_profiles(stack: str) -> Dict[str, BotProfile]:
             model="openrouter/free",
             fallback_models=["meta-llama/llama-3.1-8b-instruct:free"],
             system_prompt=compactor_prompt,
+        ),
+    }
+
+
+def build_swarm_profiles() -> Dict[str, BotProfile]:
+    return {
+        "test": BotProfile(
+            name="TestBot",
+            model="llama-3.1-8b-instant",
+            fallback_models=[],
+            system_prompt=(
+                "Generate deterministic project tests in JSON with name/body fields. "
+                "Prioritize boundaries, failures, and regressions."
+            ),
+        ),
+        "coder": BotProfile(
+            name="LocalCoder",
+            model="qwen2.5-coder:14b",
+            fallback_models=[],
+            system_prompt=(
+                "Write efficient production code that passes given tests. "
+                "Return raw code only."
+            ),
+        ),
+        "judge": BotProfile(
+            name="JudgeBot",
+            model="qwen2.5-coder:14b",
+            fallback_models=[],
+            system_prompt=(
+                "Summarize test failures into specific fix steps and likely root cause."
+            ),
         ),
     }

@@ -1,15 +1,28 @@
 # Security
 .env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
 
-# Arize Phoenix Tracing Databases
+# Local runtime and generated artifacts
+swarm_runs/
+reports/
+Modulars/swarm_runs/
+Modulars/reports/
 .phoenix/
 *.db
 
-# Python Caches
+# Python caches and test caches
 __pycache__/
+**/__pycache__/
+.pytest_cache/
+**/.pytest_cache/
 
-# Generated Unity Scripts (Optional, keeps the repo clean)
-*.cs
+# Local app temp files
+.files/
+**/.files/
 
-# Chainlit Auto-Generated Files
+# Chainlit auto-generated translations
 **/.chainlit/translations/

@@ -27,22 +27,8 @@ groq_client = OpenAI(
 local_client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
 
 
-def discover_stack():
-    files = os.listdir(".")
-    exts = {os.path.splitext(file_name)[1].lower() for file_name in files}
-    if ".cs" in exts:
-        return "Unity/C#"
-    if ".py" in exts:
-        return "Python"
-    if ".js" in exts:
-        return "Web/JS"
-    return "General Tech"
-
-
 @cl.on_chat_start
 async def start():
-    stack = discover_stack()
-
     scout = Agent(
         name="ScoutBot",
         client=groq_client,
@@ -64,7 +50,7 @@ async def start():
         fallback_models=["meta-llama/llama-3.1-70b-instruct"],
         system_prompt=(
             "Deep-Dive Technical Data Harvester. "
-            "Prioritize official documentation, Unity 6 specifics, and runnable code examples. "
+            "Prioritize official documentation and runnable examples. "
             "Deliver concise, high-signal technical findings with implementation-ready details."
         ),
     )
@@ -78,7 +64,7 @@ async def start():
             "Output ONLY clean, efficient, production-ready code. "
             "Never include markdown backticks. "
             "Include robust error handling. "
-            "Follow PEP8 for Python and standard C# coding conventions for C#."
+            "Follow established conventions in the existing repository."
         ),
     )
 
@@ -96,7 +82,6 @@ async def start():
 
     cl.user_session.set("manager", manager)
     cl.user_session.set("scout", scout)
-    cl.user_session.set("stack", stack)
     cl.user_session.set("project_status", "Project: Codex")
 
     await cl.Message(
@@ -113,15 +98,12 @@ async def start():
 async def main(message: cl.Message):
     manager = cl.user_session.get("manager")
     scout = cl.user_session.get("scout")
-    stack = cl.user_session.get("stack")
 
     async with cl.Step(name="Scouting and Research") as step:
         refined_query = await cl.make_async(scout.generate)(message.content)
         research_result = await cl.make_async(manager.execute_research_task)(refined_query)
 
-        ext = ".cs" if stack == "Unity/C#" else ".py" if stack == "Python" else ".txt"
-        filename = f"GeneratedOutput{ext}"
-
+        filename = "GeneratedOutput.txt"
         saved_path = await cl.make_async(manager.write_local_code)(filename, message.content)
         step.output = (
             f"Research command executed instantly.\n"

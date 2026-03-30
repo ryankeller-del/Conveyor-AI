@@ -16,8 +16,12 @@ from .compaction import DistillationLoop
 from .efficiency import EfficiencyAnalyzer
 from .failure_memory import FailureMemory
 from .hallucination_guard import HallucinationGuard
+from .local_runtime import AgentMemoryManager, LocalCallGovernor
 from .prompt_guard import PromptGuard
+from .preflight import PrepBundle, SwarmPreflightManager
+from .rehearsal import OfflineRehearsalManager, score_stage_state, stage_manifest_from_snapshot
 from .rosetta import RosettaStone
+from .standard_tests import StandardTestLibrary
 from .skill_evolution import SkillEvolutionManager
 from .spawn import AgentDescriptor, AgentRegistry, SpawnManager
 from .stability_guard import GuardDecision, StabilityGuard
@@ -28,6 +32,7 @@ from .types import (
     RunMetrics,
     RunSnapshot,
     RunState,
+    StageManifest,
     TaskGoal,
     TestSpec,
 )
@@ -40,11 +45,15 @@ class SwarmController:
         coder_agent: SimpleAgent,
         judge_agent: SimpleAgent,
         root_dir: str,
+        chat_agent: Optional[SimpleAgent] = None,
         context_guard_agent: Optional[SimpleAgent] = None,
         pattern_agent: Optional[SimpleAgent] = None,
         compression_agent: Optional[SimpleAgent] = None,
         novelty_agent: Optional[SimpleAgent] = None,
         stability_guard_agent: Optional[SimpleAgent] = None,
+        seed_prep_agent: Optional[SimpleAgent] = None,
+        directive_prep_agent: Optional[SimpleAgent] = None,
+        stability_prep_agent: Optional[SimpleAgent] = None,
     ):
         self.root_dir = root_dir
         self.prompt_guard = PromptGuard(guard_agent=context_guard_agent)
@@ -53,6 +62,7 @@ class SwarmController:
         self.test_bot = TestBot(test_agent, prompt_guard=self.prompt_guard)
         self.coder_agent = coder_agent
         self.judge_bot = JudgeBot(judge_agent)
+        self.chat_agent = chat_agent or coder_agent
 
         self.registry = AgentRegistry()
         for name in ["TestRefinerBot", "PerfBot", "SecurityBot", "RefactorBot"]:
@@ -63,6 +73,12 @@ class SwarmController:
 
         self.efficiency = EfficiencyAnalyzer()
         self.failure_memory = FailureMemory(os.path.join(self.root_dir, "swarm_learning"))
+        self.agent_memory = AgentMemoryManager(
+            os.path.join(self.root_dir, "swarm_learning", "agent_memory"),
+            max_packet_chars=1800,
+        )
+        self.standard_tests = StandardTestLibrary()
+        self.local_governor = LocalCallGovernor()
         self.hallucination_guard = HallucinationGuard(self.root_dir)
         self.distillation = DistillationLoop(
             pattern_agent=pattern_agent,
@@ -70,7 +86,15 @@ class SwarmController:
             novelty_agent=novelty_agent,
         )
         self.stability_guard = StabilityGuard(stability_guard_agent)
+        self.preflight = SwarmPreflightManager(
+            root_dir=self.root_dir,
+            seed_agent=seed_prep_agent,
+            directive_agent=directive_prep_agent,
+            stability_agent=stability_prep_agent,
+        )
+        self.rehearsal = OfflineRehearsalManager(self.root_dir)
         self._lock = threading.RLock()
+        self._rehearsal_lock = threading.RLock()
         self._pause_event = threading.Event()
         self._pause_event.set()
 
@@ -94,6 +118,20 @@ class SwarmController:
         self.latest_memory_payloads = {"BLUEPRINT": "", "NARRATIVE": "", "COMMAND": ""}
         self.latest_breadcrumb = ""
         self.active_compaction_interval = 5
+        self.latest_local_memory_note = ""
+        self.latest_local_memory_agent = ""
+        self.latest_local_memory_task_family = ""
+        self.local_api_inflight = 0
+        self.local_api_throttle_hits = 0
+        self.returned_failure_streak = 0
+        self.standard_test_fallback_count = 0
+        self.latest_standard_test_reason = ""
+        self.latest_standard_test_pack = ""
+        self.latest_specialist_profiles: List[Dict[str, object]] = []
+        self.chat_mode = "chat"
+        self.chat_turn_count = 0
+        self.latest_architect_instruction = ""
+        self.queued_architect_briefs: List[str] = []
         self.recent_metrics: List[RunMetrics] = []
         self.unfinished_features: List[str] = []
         self.current_focus = ""
@@ -108,7 +146,18 @@ class SwarmController:
         self.rosetta_warning_count = 0
         self.latest_rosetta_warning = ""
         self.latest_skill_event = ""
+        self.preflight_goal: Optional[TaskGoal] = None
+        self.preflight_config: Optional[RunConfig] = None
+        self.active_run_config: Optional[RunConfig] = None
+        self.preflight_bundle: Optional[PrepBundle] = None
         self.artifacts: Optional[ArtifactStore] = None
+        self.live_stage_manifest = None
+        self.latest_rehearsal = None
+        self.rehearsal_state = "IDLE"
+        self.rehearsal_profile = ""
+        self.rehearsal_report_path = ""
+        self.rehearsal_manifest_path = ""
+        self.rehearsal_trace_path = ""
 
     def _wave_name(self, idx: int) -> str:
         return ["BASELINE", "ROBUSTNESS", "MUTATION_REGRESSION"][min(idx, 2)]
@@ -119,8 +168,16 @@ class SwarmController:
                 raise RuntimeError("Run already active")
 
             run_config = config or RunConfig()
+            if run_config.preflight_enabled and self._needs_preflight(goal):
+                self.preflight_goal = goal
+                self.preflight_config = RunConfig(**asdict(run_config))
+                self.preflight_bundle = self.preflight.build_bundle(goal, run_config)
+                self.last_status = "Preflight bundle prepared"
+            self.active_run_config = RunConfig(**asdict(run_config))
             self.run_id = datetime.utcnow().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
             self.artifacts = ArtifactStore(run_config.artifacts_dir, self.run_id)
+            queued_briefs = list(self.queued_architect_briefs)
+            self.queued_architect_briefs = []
             self.snapshot = RunSnapshot(
                 run_id=self.run_id,
                 state=RunState.RUNNING,
@@ -136,10 +193,21 @@ class SwarmController:
                 compaction_interval_active=max(1, run_config.compaction_interval_waves),
                 directives_active=run_config.directive_mode_enabled,
             )
+            self.live_stage_manifest = stage_manifest_from_snapshot(
+                self.snapshot,
+                run_config,
+                current_stage=self.snapshot.wave_name,
+                next_stage=self._wave_name(1),
+                source="live",
+                profile="live",
+                note="Initial live stage manifest",
+            )
             self.active_compaction_interval = max(1, run_config.compaction_interval_waves)
             self.recent_metrics = []
-            self.unfinished_features = []
-            self.current_focus = goal.prompt[: run_config.max_problem_scope_chars]
+            self.unfinished_features = queued_briefs[:]
+            self.current_focus = (
+                queued_briefs[0] if queued_briefs else goal.prompt[: run_config.max_problem_scope_chars]
+            )
             self.open_handoffs = {}
             self.handoff_feedback_log = []
             self.ramp_level = 0
@@ -151,6 +219,25 @@ class SwarmController:
             self.rosetta_warning_count = 0
             self.latest_rosetta_warning = ""
             self.latest_skill_event = ""
+            self.chat_mode = "chat"
+            self.chat_turn_count = 0
+            self.latest_architect_instruction = ""
+            self.latest_local_memory_note = ""
+            self.latest_local_memory_agent = ""
+            self.latest_local_memory_task_family = ""
+            self.local_api_inflight = 0
+            self.local_api_throttle_hits = 0
+            self.returned_failure_streak = 0
+            self.standard_test_fallback_count = 0
+            self.latest_standard_test_reason = ""
+            self.latest_standard_test_pack = ""
+            self.latest_specialist_profiles = []
+            self.latest_rehearsal = None
+            self.rehearsal_state = "IDLE"
+            self.rehearsal_profile = ""
+            self.rehearsal_report_path = ""
+            self.rehearsal_manifest_path = ""
+            self.rehearsal_trace_path = ""
             self._pause_event.set()
             self.artifacts.append_progress("Run started")
             self.artifacts.append_event("run_started", {"goal": asdict(goal), "config": asdict(run_config)})
@@ -191,13 +278,569 @@ class SwarmController:
             self.last_status = "Stopping requested"
             self._save_state()
 
+    def prepare_run(self, goal: TaskGoal, config: Optional[RunConfig] = None) -> Dict:
+        with self._lock:
+            if self.snapshot.state == RunState.RUNNING:
+                raise RuntimeError("Cannot prepare a new run while another run is active")
+
+            run_config = config or RunConfig()
+            self.preflight_goal = goal
+            self.preflight_config = RunConfig(**asdict(run_config))
+            self.preflight_bundle = self.preflight.build_bundle(goal, run_config)
+            self.snapshot.state = RunState.PREPARING
+            self.snapshot.phase = ControllerPhase.PREPARING
+            self.last_status = "Preflight bundle prepared"
+            self._save_state()
+            self._refresh_user_guidance(run_config)
+
+        if self.artifacts:
+            self.artifacts.append_event(
+                "preflight_prepared",
+                {
+                    "bundle_id": self.preflight_bundle.bundle_id if self.preflight_bundle else "",
+                    "goal": asdict(goal),
+                    "requested_tools": self.preflight_bundle.requested_tools if self.preflight_bundle else [],
+                    "requested_updates": self.preflight_bundle.requested_updates if self.preflight_bundle else [],
+                },
+            )
+            self.artifacts.append_progress(
+                f"Preflight prepared: {self.preflight_bundle.bundle_id if self.preflight_bundle else 'n/a'}"
+            )
+        return self.status()
+
+    def review_preflight(self, target: str, decision: str, note: str = "") -> Dict:
+        with self._lock:
+            if not self.preflight_bundle:
+                raise RuntimeError("No preflight bundle is available")
+            bundle = self.preflight.review_proposal(
+                bundle_id=self.preflight_bundle.bundle_id,
+                target=target,
+                decision=decision,
+                note=note,
+            )
+            self.preflight_bundle = bundle
+            if bundle.ready_to_launch:
+                self.last_status = "Preflight bundle approved and ready to launch"
+            else:
+                self.last_status = f"Preflight review updated: {bundle.status}"
+            self._save_state()
+            self._refresh_user_guidance(self.preflight_config or RunConfig())
+
+        if self.artifacts:
+            self.artifacts.append_event(
+                "preflight_review",
+                {
+                    "bundle_id": self.preflight_bundle.bundle_id if self.preflight_bundle else "",
+                    "target": target,
+                    "decision": decision,
+                    "note": note[:400],
+                },
+            )
+            self.artifacts.append_progress(
+                f"Preflight review {decision.upper()} for {target}"
+            )
+        return self.status()
+
+    def launch_prepared_run(self) -> str:
+        with self._lock:
+            if not self.preflight_goal or not self.preflight_config or not self.preflight_bundle:
+                raise RuntimeError("No prepared run is available")
+            goal = self.preflight_goal
+            config = self._merge_preflight_config()
+
+        return self.start(goal, config)
+
     def status(self) -> Dict:
         with self._lock:
             payload = asdict(self.snapshot)
             payload["state"] = self.snapshot.state.value
             payload["phase"] = self.snapshot.phase.value
             payload["last_status"] = self.last_status
+            payload["prep_ready_to_launch"] = self._preflight_is_ready()
+            payload["prep_goal"] = self.preflight_goal.prompt if self.preflight_goal else ""
+            payload["prep_proposals"] = self._preflight_status_rows()
+            payload["prep_requested_tools"] = (
+                list(self.preflight_bundle.requested_tools) if self.preflight_bundle else []
+            )
+            payload["prep_requested_updates"] = (
+                list(self.preflight_bundle.requested_updates) if self.preflight_bundle else []
+            )
+            payload["prep_required_testing_tools"] = (
+                list(getattr(self.preflight, "_required_testing_tools", []))
+                if self.preflight_bundle
+                else []
+            )
+            payload["prep_required_reporting_tools"] = (
+                list(getattr(self.preflight, "_required_reporting_tools", []))
+                if self.preflight_bundle
+                else []
+            )
+            payload["prep_required_diagnostics_tools"] = (
+                list(getattr(self.preflight, "_required_diagnostics_tools", []))
+                if self.preflight_bundle
+                else []
+            )
+            payload["stage_manifest_id"] = (
+                getattr(self.live_stage_manifest, "manifest_id", "")
+                if self.live_stage_manifest
+                else ""
+            )
+            payload["stage_manifest_source"] = (
+                getattr(self.live_stage_manifest, "source", "")
+                if self.live_stage_manifest
+                else ""
+            )
+            payload["stage_manifest_profile"] = (
+                getattr(self.live_stage_manifest, "profile", "")
+                if self.live_stage_manifest
+                else ""
+            )
+            payload["stage_manifest_current"] = (
+                getattr(self.live_stage_manifest, "current_stage", "")
+                if self.live_stage_manifest
+                else ""
+            )
+            payload["stage_manifest_next"] = (
+                getattr(self.live_stage_manifest, "next_stage", "")
+                if self.live_stage_manifest
+                else ""
+            )
+            payload["stage_manifest_score"] = (
+                getattr(self.live_stage_manifest, "score", 0.0)
+                if self.live_stage_manifest
+                else 0.0
+            )
+            payload["stage_manifest_note"] = (
+                getattr(self.live_stage_manifest, "note", "")
+                if self.live_stage_manifest
+                else ""
+            )
+            payload["stage_manifest_preload_bundle"] = (
+                list(getattr(self.live_stage_manifest, "preload_bundle", []))
+                if self.live_stage_manifest
+                else []
+            )
+            payload["stage_manifest_required_tools"] = (
+                list(getattr(self.live_stage_manifest, "required_tools", []))
+                if self.live_stage_manifest
+                else []
+            )
+            payload["stage_manifest_report_checklist"] = (
+                list(getattr(self.live_stage_manifest, "report_checklist", []))
+                if self.live_stage_manifest
+                else []
+            )
+            payload["rehearsal_id"] = self.snapshot.rehearsal_id
+            payload["rehearsal_state"] = self.rehearsal_state
+            payload["rehearsal_profile"] = self.rehearsal_profile
+            payload["rehearsal_report_path"] = self.rehearsal_report_path
+            payload["rehearsal_manifest_path"] = self.rehearsal_manifest_path
+            payload["rehearsal_trace_path"] = self.rehearsal_trace_path
+            memory_status = self.agent_memory.status()
+            payload["local_memory_packet_count"] = memory_status.get("packet_count", 0)
+            payload["local_memory_reuse_count"] = memory_status.get("reuse_count", 0)
+            payload["local_memory_invalidations"] = memory_status.get("invalidations", 0)
+            payload["latest_local_memory_note"] = memory_status.get("latest_note", "")
+            payload["latest_local_memory_agent"] = memory_status.get("latest_agent", "")
+            payload["latest_local_memory_task_family"] = memory_status.get(
+                "latest_task_family", ""
+            )
+            profile_limit = (self.active_run_config or self.preflight_config or RunConfig()).specialist_profile_limit
+            payload["specialist_profiles"] = self.agent_memory.specialist_profiles(limit=profile_limit)
+            payload["returned_failure_streak"] = self.returned_failure_streak
+            payload["standard_test_fallback_count"] = self.standard_test_fallback_count
+            payload["latest_standard_test_reason"] = self.latest_standard_test_reason
+            payload["latest_standard_test_pack"] = self.latest_standard_test_pack
+            governor_status = self.local_governor.status()
+            payload["local_api_inflight"] = governor_status.get("inflight", 0)
+            payload["local_api_throttle_hits"] = governor_status.get("throttle_hits", 0)
+            payload["local_api_user_waiting"] = governor_status.get("user_waiting", 0)
+            payload["local_api_swarm_waiting"] = governor_status.get("swarm_waiting", 0)
+            payload["local_api_last_lane"] = governor_status.get("last_lane", "swarm")
+            payload["chat_mode"] = self.chat_mode
+            payload["chat_turn_count"] = self.chat_turn_count
+            payload["queued_architect_instruction_count"] = len(self.queued_architect_briefs)
+            payload["latest_architect_instruction"] = self.latest_architect_instruction
             return payload
+
+    def queue_architect_instruction(self, instruction: str, source: str = "chat") -> None:
+        clean = (instruction or "").strip()
+        if not clean:
+            return
+        clean = clean[:400]
+        with self._lock:
+            self.queued_architect_briefs.append(clean)
+            self.queued_architect_briefs = self.queued_architect_briefs[-6:]
+            self.latest_architect_instruction = clean
+            self.chat_mode = "architect"
+            if self.snapshot.state == RunState.RUNNING:
+                if all(item.lower() != clean.lower() for item in self.unfinished_features):
+                    self.unfinished_features.insert(0, clean)
+                self.current_focus = clean[: self.active_run_config.max_problem_scope_chars] if self.active_run_config else clean[:1200]
+            self._save_state()
+        if self.artifacts:
+            self.artifacts.append_event(
+                "architect_instruction_queued",
+                {"instruction": clean, "source": source},
+            )
+            self.artifacts.append_progress(
+                f"Queued architect instruction from {source}: {clean[:180]}"
+            )
+
+    def respond_to_chat(
+        self,
+        message_text: str,
+        config: Optional[RunConfig] = None,
+        mode: Optional[str] = None,
+        conversation_context: str = "",
+    ) -> Dict[str, str]:
+        cfg = config or self.active_run_config or self.preflight_config or RunConfig()
+        chat_mode = self._normalize_chat_mode(mode or "chat", message_text)
+        status = self.status()
+        prompt = self._build_chat_prompt(
+            message_text=message_text,
+            mode=chat_mode,
+            status=status,
+            conversation_context=conversation_context,
+        )
+        raw = self._safe_generate(
+            agent=self.chat_agent,
+            prompt=prompt,
+            purpose=f"chat-{chat_mode}",
+            config=cfg,
+            task_family=f"chat:{chat_mode}",
+        )
+        parsed = self._parse_chat_response(
+            raw=raw,
+            mode=chat_mode,
+            message_text=message_text,
+            status=status,
+        )
+        reply = parsed.get("reply") or self._fallback_chat_reply(
+            mode=chat_mode,
+            message_text=message_text,
+            status=status,
+        )
+        background_instruction = parsed.get("background_instruction", "").strip()
+        swarm_health = parsed.get("swarm_health", "").strip()
+        if chat_mode == "architect" and not background_instruction:
+            background_instruction = (
+                f"Main architect: address the user's request '{message_text[:160]}' with the "
+                "smallest safe change and keep the conversation lane responsive."
+            )
+        if background_instruction:
+            self.queue_architect_instruction(background_instruction, source="chat")
+        with self._lock:
+            self.chat_mode = chat_mode
+            self.chat_turn_count += 1
+            self._save_state()
+        return {
+            "mode": chat_mode,
+            "reply": reply,
+            "background_instruction": background_instruction,
+            "swarm_health": swarm_health,
+        }
+
+    def _normalize_chat_mode(self, mode: str, message_text: str) -> str:
+        clean = (mode or "chat").strip().lower()
+        if clean in {"health", "architect", "chat"}:
+            return clean
+        text = (message_text or "").strip().lower()
+        if text.startswith("/health"):
+            return "health"
+        if text.startswith("/architect"):
+            return "architect"
+        return "chat"
+
+    def _build_chat_prompt(
+        self,
+        message_text: str,
+        mode: str,
+        status: Dict[str, object],
+        conversation_context: str = "",
+    ) -> str:
+        lines = [
+            "You are LocalChatBot, the user's priority local assistant for this swarm.",
+            "Return valid JSON only with keys: reply, background_instruction, swarm_health, mode.",
+            f"Requested mode: {mode}.",
+            "Rules:",
+            "- chat: answer conversationally and briefly.",
+            "- health: summarize swarm health, blockers, and next useful action.",
+            "- architect: give a concise reply and a compact background instruction for the main swarm architect.",
+            "Swarm status:",
+            f"state={status.get('state', 'IDLE')}; phase={status.get('phase', 'PREPARING')}; ",
+            f"wave={status.get('wave_name', 'BASELINE')} ({status.get('wave_index', 0)}); ",
+            f"active_topology={', '.join(status.get('active_topology', []))}; ",
+            f"open_handoffs={status.get('open_handoff_count', 0)}; ",
+            f"guard_mode={status.get('guard_mode', 'NORMAL')}; ",
+            f"hallucination_confidence={status.get('hallucination_confidence', 1.0):.3f}; ",
+            f"local_api_inflight={status.get('local_api_inflight', 0)}; ",
+            f"queued_architect_instructions={status.get('queued_architect_instruction_count', 0)}; ",
+            f"latest_architect_instruction={status.get('latest_architect_instruction', '')}",
+            f"User message: {message_text.strip()}",
+        ]
+        if conversation_context.strip():
+            lines.extend(
+                [
+                    "Recent conversation:",
+                    conversation_context.strip()[:2800],
+                ]
+            )
+        return "\n".join(lines)
+
+    def _parse_chat_response(
+        self,
+        raw: str,
+        mode: str,
+        message_text: str,
+        status: Dict[str, object],
+    ) -> Dict[str, str]:
+        payload: Dict[str, str] = {}
+        text = (raw or "").strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            text = text.replace("json\n", "", 1).strip()
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                payload = {
+                    str(key): str(value)
+                    for key, value in parsed.items()
+                    if value is not None
+                }
+        except Exception:
+            payload = {}
+
+        reply = payload.get("reply", "").strip()
+        swarm_health = payload.get("swarm_health", "").strip()
+        background_instruction = payload.get("background_instruction", "").strip()
+        mode_value = payload.get("mode", mode).strip() or mode
+        if not reply:
+            reply = self._fallback_chat_reply(mode=mode_value, message_text=message_text, status=status)
+        return {
+            "reply": reply,
+            "background_instruction": background_instruction,
+            "swarm_health": swarm_health,
+            "mode": mode_value,
+        }
+
+    def _fallback_chat_reply(
+        self,
+        mode: str,
+        message_text: str,
+        status: Dict[str, object],
+    ) -> str:
+        if mode == "health":
+            return (
+                f"Swarm is {status.get('state', 'IDLE')} in {status.get('phase', 'PREPARING')}. "
+                f"Wave {status.get('wave_name', 'BASELINE')} has {status.get('passing_tests', 0)} passing tests."
+            )
+        if mode == "architect":
+            return (
+                "I queued a concise architect brief and kept the local chat lane open. "
+                "Tell me the next change or ask for a swarm health check."
+            )
+        return (
+            "I’m here and the local lane is open. "
+            "Ask for swarm health, request architect changes, or keep chatting."
+        )
+
+    def _preflight_is_ready(self) -> bool:
+        return bool(self.preflight_bundle and self.preflight_bundle.ready_to_launch)
+
+    def _needs_preflight(self, goal: TaskGoal) -> bool:
+        if not self.preflight_bundle or not self.preflight_goal:
+            return True
+        return (
+            self.preflight_goal.prompt != goal.prompt
+            or list(self.preflight_goal.target_files) != list(goal.target_files)
+            or self.preflight_goal.language != goal.language
+        )
+
+    def _preflight_status_rows(self) -> List[Dict[str, object]]:
+        if not self.preflight_bundle:
+            return []
+        rows: List[Dict[str, object]] = []
+        for proposal in self.preflight_bundle.proposals:
+            rows.append(
+                {
+                    "proposal_id": proposal.proposal_id,
+                    "agent_name": proposal.agent_name,
+                    "goal_key": proposal.goal_key,
+                    "title": proposal.title,
+                    "suggested_action": proposal.suggested_action,
+                    "expected_benefit": proposal.expected_benefit,
+                    "risk_if_wrong": proposal.risk_if_wrong,
+                    "validation_plan": proposal.validation_plan,
+                    "config_overrides": proposal.config_overrides,
+                    "requested_tools": proposal.requested_tools,
+                    "requested_updates": proposal.requested_updates,
+                    "status": proposal.status,
+                    "review_note": proposal.review_note,
+                    "validation_note": proposal.validation_note,
+                }
+            )
+        return rows
+
+    def _merge_preflight_config(self) -> RunConfig:
+        if not self.preflight_config:
+            return RunConfig()
+        payload = asdict(self.preflight_config)
+        if self.preflight_bundle and self.preflight_bundle.launch_overrides:
+            payload.update(self.preflight_bundle.launch_overrides)
+        return RunConfig(**payload)
+
+    def _effective_config(self, config: RunConfig) -> RunConfig:
+        if not config.stage_manifest_hot_swap_enabled:
+            return config
+        payload = asdict(config)
+        if self.live_stage_manifest and (
+            self.live_stage_manifest.runtime_overrides
+            or self.live_stage_manifest.guard_overrides
+        ):
+            payload.update(self.live_stage_manifest.runtime_overrides)
+            payload.update(self.live_stage_manifest.guard_overrides)
+        return RunConfig(**payload)
+
+    def run_rehearsal(
+        self,
+        profile: Optional[str] = None,
+        config: Optional[RunConfig] = None,
+        apply_if_better: bool = True,
+    ) -> Dict[str, object]:
+        with self._lock:
+            live_snapshot = RunSnapshot(**asdict(self.snapshot))
+            live_manifest = self.live_stage_manifest
+            run_config = config or self.active_run_config or self.preflight_config or RunConfig()
+            chosen_profile = (profile or run_config.rehearsal_profile or "balanced").strip().lower()
+            self.rehearsal_state = "RUNNING"
+            self.rehearsal_profile = chosen_profile
+            self.snapshot.rehearsal_state = self.rehearsal_state
+            self.snapshot.rehearsal_profile = self.rehearsal_profile
+            self._save_state()
+
+        outcome = self.rehearsal.simulate(
+            snapshot=live_snapshot,
+            config=run_config,
+            profile=chosen_profile,
+            live_manifest=live_manifest,
+        )
+
+        accepted = False
+        if apply_if_better and outcome.accepted:
+            accepted = self.apply_stage_manifest(outcome.manifest, outcome)
+
+        with self._lock:
+            self.latest_rehearsal = outcome
+            self.rehearsal_state = "APPLIED" if accepted else "COMPLETE"
+            self.rehearsal_profile = chosen_profile
+            self.rehearsal_report_path = outcome.report_path
+            self.rehearsal_manifest_path = outcome.manifest_path
+            self.rehearsal_trace_path = outcome.trace_path
+            self.snapshot.rehearsal_id = outcome.rehearsal_id
+            self.snapshot.rehearsal_state = self.rehearsal_state
+            self.snapshot.rehearsal_profile = self.rehearsal_profile
+            self.snapshot.rehearsal_report_path = self.rehearsal_report_path
+            self.snapshot.rehearsal_manifest_path = self.rehearsal_manifest_path
+            self.snapshot.rehearsal_trace_path = self.rehearsal_trace_path
+            self._save_state()
+
+        if self.artifacts:
+            self.artifacts.append_event(
+                "rehearsal_completed",
+                {
+                    "rehearsal_id": outcome.rehearsal_id,
+                    "profile": chosen_profile,
+                    "accepted": accepted,
+                    "live_score": outcome.live_score,
+                    "rehearsal_score": outcome.rehearsal_score,
+                    "report_path": outcome.report_path,
+                    "manifest_path": outcome.manifest_path,
+                },
+            )
+            self.artifacts.append_progress(
+                f"Rehearsal {outcome.rehearsal_id} completed with accepted={accepted}."
+            )
+
+        return {
+            "rehearsal_id": outcome.rehearsal_id,
+            "profile": chosen_profile,
+            "accepted": accepted,
+            "live_score": outcome.live_score,
+            "rehearsal_score": outcome.rehearsal_score,
+            "report_path": outcome.report_path,
+            "manifest_path": outcome.manifest_path,
+            "trace_path": outcome.trace_path,
+            "stage_manifest": asdict(outcome.manifest),
+            "stage_timeline": outcome.stage_timeline,
+            "failure_trace": outcome.failure_trace,
+        }
+
+    def apply_stage_manifest(self, manifest, rehearsal: Optional[object] = None) -> bool:
+        if manifest is None:
+            return False
+        if isinstance(manifest, dict):
+            manifest = StageManifest(**manifest)
+        if not getattr(manifest, "manifest_id", ""):
+            return False
+        if not self.live_stage_manifest:
+            current_score = 0.0
+        else:
+            current_score = float(getattr(self.live_stage_manifest, "score", 0.0))
+        if not self.active_run_config and not self.preflight_config and not self.snapshot.run_id:
+            return False
+
+        compare_score = float(getattr(manifest, "score", 0.0))
+        min_delta = 0.0
+        config = self.active_run_config or self.preflight_config or RunConfig()
+        if not config.stage_manifest_hot_swap_enabled:
+            return False
+        if isinstance(rehearsal, dict) and rehearsal.get("accepted") is False:
+            return False
+        min_delta = float(getattr(config, "stage_manifest_min_score_delta", 0.05))
+        if compare_score <= current_score + min_delta:
+            if self.artifacts:
+                self.artifacts.append_event(
+                    "stage_manifest_rejected",
+                    {
+                        "manifest_id": manifest.manifest_id,
+                        "current_score": current_score,
+                        "candidate_score": compare_score,
+                        "minimum_delta": min_delta,
+                    },
+                )
+            return False
+
+        self.live_stage_manifest = manifest
+        with self._lock:
+            self.snapshot.stage_manifest_id = manifest.manifest_id
+            self.snapshot.stage_manifest_source = manifest.source
+            self.snapshot.stage_manifest_profile = manifest.profile
+            self.snapshot.stage_manifest_current = manifest.current_stage
+            self.snapshot.stage_manifest_next = manifest.next_stage
+            self.snapshot.stage_manifest_score = manifest.score
+            self.snapshot.stage_manifest_note = manifest.note[:300]
+            self._save_state()
+
+        if self.artifacts:
+            self.artifacts.append_event(
+                "stage_manifest_applied",
+                {
+                    "manifest_id": manifest.manifest_id,
+                    "current_stage": manifest.current_stage,
+                    "next_stage": manifest.next_stage,
+                    "score": manifest.score,
+                    "source": manifest.source,
+                    "profile": manifest.profile,
+                    "preload_bundle": manifest.preload_bundle,
+                    "required_tools": manifest.required_tools,
+                    "report_checklist": manifest.report_checklist,
+                },
+            )
+            self.artifacts.append_progress(
+                f"Applied stage manifest {manifest.manifest_id} at score {manifest.score:.4f}."
+            )
+        return True
 
     def _save_state(self) -> None:
         self.snapshot.unfinished_feature_count = len(self.unfinished_features)
@@ -215,6 +858,72 @@ class SwarmController:
         self.snapshot.active_skill_count = len(self.skill_evolution.active_skills)
         self.snapshot.skill_retool_count = self.skill_evolution.retool_count
         self.snapshot.latest_skill_event = self.latest_skill_event[:280]
+        memory_status = self.agent_memory.status()
+        self.snapshot.local_memory_packet_count = int(memory_status.get("packet_count", 0))
+        self.snapshot.local_memory_reuse_count = int(memory_status.get("reuse_count", 0))
+        self.snapshot.local_memory_invalidations = int(memory_status.get("invalidations", 0))
+        self.snapshot.local_api_inflight = int(self.local_governor.status().get("inflight", 0))
+        self.snapshot.local_api_throttle_hits = int(
+            self.local_governor.status().get("throttle_hits", 0)
+        )
+        governor_status = self.local_governor.status()
+        self.snapshot.local_api_user_waiting = int(governor_status.get("user_waiting", 0))
+        self.snapshot.local_api_swarm_waiting = int(governor_status.get("swarm_waiting", 0))
+        self.snapshot.local_api_last_lane = str(governor_status.get("last_lane", "swarm"))
+        self.snapshot.latest_local_memory_note = str(memory_status.get("latest_note", ""))[:280]
+        self.snapshot.latest_local_memory_agent = str(memory_status.get("latest_agent", ""))[:140]
+        self.snapshot.latest_local_memory_task_family = str(
+            memory_status.get("latest_task_family", "")
+        )[:140]
+        self.snapshot.standard_test_fallback_count = self.standard_test_fallback_count
+        self.snapshot.latest_standard_test_reason = self.latest_standard_test_reason[:280]
+        self.snapshot.latest_standard_test_pack = self.latest_standard_test_pack[:280]
+        self.snapshot.returned_failure_streak = self.returned_failure_streak
+        self.snapshot.specialist_profiles = self.agent_memory.specialist_profiles(
+            limit=(self.active_run_config or self.preflight_config or RunConfig()).specialist_profile_limit
+        )
+        self.snapshot.chat_mode = self.chat_mode
+        self.snapshot.chat_turn_count = self.chat_turn_count
+        self.snapshot.queued_architect_instruction_count = len(self.queued_architect_briefs)
+        self.snapshot.latest_architect_instruction = self.latest_architect_instruction[:280]
+        if self.live_stage_manifest:
+            self.snapshot.stage_manifest_id = self.live_stage_manifest.manifest_id
+            self.snapshot.stage_manifest_source = self.live_stage_manifest.source
+            self.snapshot.stage_manifest_profile = self.live_stage_manifest.profile
+            self.snapshot.stage_manifest_current = self.live_stage_manifest.current_stage
+            self.snapshot.stage_manifest_next = self.live_stage_manifest.next_stage
+            self.snapshot.stage_manifest_score = self.live_stage_manifest.score
+            self.snapshot.stage_manifest_note = self.live_stage_manifest.note[:300]
+        if self.preflight_bundle:
+            self.snapshot.prep_bundle_id = self.preflight_bundle.bundle_id
+            self.snapshot.prep_status = self.preflight_bundle.status
+            self.snapshot.prep_pending_count = sum(
+                1 for item in self.preflight_bundle.proposals if item.status == "PENDING"
+            )
+            self.snapshot.prep_approved_count = sum(
+                1 for item in self.preflight_bundle.proposals if item.status == "APPROVED"
+            )
+            self.snapshot.prep_denied_count = sum(
+                1 for item in self.preflight_bundle.proposals if item.status == "DENIED"
+            )
+            self.snapshot.prep_revise_count = sum(
+                1 for item in self.preflight_bundle.proposals if item.status == "REVISE"
+            )
+            self.snapshot.prep_last_validation = self.preflight_bundle.validation_note[:320]
+        else:
+            self.snapshot.prep_bundle_id = ""
+            self.snapshot.prep_status = "NONE"
+            self.snapshot.prep_pending_count = 0
+            self.snapshot.prep_approved_count = 0
+            self.snapshot.prep_denied_count = 0
+            self.snapshot.prep_revise_count = 0
+            self.snapshot.prep_last_validation = ""
+        self.snapshot.rehearsal_id = getattr(self.latest_rehearsal, "rehearsal_id", self.snapshot.rehearsal_id)
+        self.snapshot.rehearsal_state = self.rehearsal_state
+        self.snapshot.rehearsal_profile = self.rehearsal_profile
+        self.snapshot.rehearsal_report_path = self.rehearsal_report_path
+        self.snapshot.rehearsal_manifest_path = self.rehearsal_manifest_path
+        self.snapshot.rehearsal_trace_path = self.rehearsal_trace_path
         if self.artifacts:
             self.artifacts.save_snapshot(self.snapshot)
 
@@ -227,6 +936,7 @@ class SwarmController:
             for wave_idx in range(config.max_waves):
                 if not self._gate_run_state():
                     return
+                effective_config = self._effective_config(config)
 
                 with self._lock:
                     self.snapshot.phase = ControllerPhase.TEST_WAVE_GEN
@@ -234,22 +944,33 @@ class SwarmController:
                     self.snapshot.wave_name = self._wave_name(wave_idx)
                     self._save_state()
 
-                test_specs = self._generate_wave_tests(goal, config, previous_tests)
+                self.live_stage_manifest = stage_manifest_from_snapshot(
+                    self.snapshot,
+                    effective_config,
+                    current_stage=self.snapshot.wave_name,
+                    next_stage=self._wave_name(wave_idx + 1),
+                    source="live",
+                    profile="live",
+                    note="Live stage refresh",
+                )
+                self._save_state()
+
+                test_specs = self._generate_wave_tests(goal, effective_config, previous_tests)
                 if not test_specs:
-                    self._complete("No new meaningful tests generated.")
+                    self._complete("No new meaningful tests generated.", config=effective_config)
                     return
 
                 for spec in test_specs:
                     self._write_file(spec.path, spec.content)
                     self.snapshot.total_tests += self._count_tests(spec.content)
-                self._apply_population_control(config)
+                self._apply_population_control(effective_config)
 
                 cycle_start = time.time()
                 pass_count = 0
                 attempts = 0
                 failure_recurrence = 0
 
-                retry_limit = config.local_retry_limit + self.ramp_level
+                retry_limit = effective_config.local_retry_limit + self.ramp_level
                 for attempt in range(retry_limit + 1):
                     if not self._gate_run_state():
                         return
@@ -259,17 +980,17 @@ class SwarmController:
                         self.snapshot.phase = ControllerPhase.IMPLEMENT
                         self._save_state()
 
-                    generated_code = self._implement(goal, test_specs, attempt, config)
+                    generated_code = self._implement(goal, test_specs, attempt, effective_config)
 
                     guard_passed = True
-                    if config.hallucination_guard_enabled:
+                    if effective_config.hallucination_guard_enabled:
                         with self._lock:
                             self.snapshot.phase = ControllerPhase.HALLUCINATION_GUARD
                             self._save_state()
                         guard_passed = self._run_hallucination_guard(
                             goal=goal,
                             generated_code=generated_code,
-                            config=config,
+                            config=effective_config,
                             cycle_index=wave_idx,
                         )
                         if not guard_passed:
@@ -280,7 +1001,7 @@ class SwarmController:
                         self.snapshot.phase = ControllerPhase.JUDGE
                         self._save_state()
 
-                    passed, judge_output = self._judge(goal, test_specs, config)
+                    passed, judge_output = self._judge(goal, test_specs, effective_config)
                     if passed:
                         pass_count = len(test_specs)
                         self._resolve_current_unfinished_feature()
@@ -289,20 +1010,20 @@ class SwarmController:
 
                     failure_recurrence += 1
                     self._register_unfinished_feature(judge_output)
-                    if config.dynamic_spawning_enabled:
-                        self._spawn_for_failure(goal, judge_output, config)
+                    if effective_config.dynamic_spawning_enabled:
+                        self._spawn_for_failure(goal, judge_output, effective_config)
 
-                    fix_list = self._generate_fix_list(judge_output, config)
+                    fix_list = self._generate_fix_list(judge_output, effective_config)
                     self.artifacts.append_progress(
                         f"Retry {attempt + 1}: judge suggested fixes captured"
                     )
-                    if config.failure_memory_enabled:
+                    if effective_config.failure_memory_enabled:
                         self._record_failure(goal, judge_output, fix_list)
                     self._register_unfinished_feature(fix_list)
                     self._pass_back_failed_handoffs(
                         failure_output=judge_output,
                         fix_list=fix_list,
-                        config=config,
+                        config=effective_config,
                     )
                     self._apply_fix_pass(goal, fix_list)
 
@@ -330,16 +1051,16 @@ class SwarmController:
                     else:
                         self.snapshot.no_gain_waves = 0
 
-                if consecutive_failed_waves >= max(1, config.max_consecutive_failed_waves):
-                    self._complete("Consecutive failed waves limit reached.", config=config)
+                if consecutive_failed_waves >= max(1, effective_config.max_consecutive_failed_waves):
+                    self._complete("Consecutive failed waves limit reached.", config=effective_config)
                     return
 
-                if self.snapshot.total_tests >= config.max_total_tests:
-                    self._complete("Reached max_total_tests.", config=config)
+                if self.snapshot.total_tests >= effective_config.max_total_tests:
+                    self._complete("Reached max_total_tests.", config=effective_config)
                     return
 
-                if self.snapshot.no_gain_waves >= config.max_no_gain_waves:
-                    self._complete("Coverage gain plateau reached.", config=config)
+                if self.snapshot.no_gain_waves >= effective_config.max_no_gain_waves:
+                    self._complete("Coverage gain plateau reached.", config=effective_config)
                     return
 
                 with self._lock:
@@ -360,18 +1081,18 @@ class SwarmController:
                 self.recent_metrics = self.recent_metrics[-6:]
                 score = self.efficiency.update(topology_key, metric)
                 self._update_memory_format_performance(metric)
-                self._update_ramp_level(config, metric)
+                self._update_ramp_level(effective_config, metric)
                 decision = self.stability_guard.evaluate(
                     snapshot=self.snapshot,
                     metric=metric,
                     recent_metrics=self.recent_metrics,
-                    config=config,
+                    config=effective_config,
                 )
-                if self._apply_guard_decision(decision, config):
+                if self._apply_guard_decision(decision, effective_config):
                     return
-                self._evaluate_skill_evolution(metric=metric, config=config)
-                self._adapt_compaction_policy(config, metric)
-                self._refresh_user_guidance(config)
+                self._evaluate_skill_evolution(metric=metric, config=effective_config)
+                self._adapt_compaction_policy(effective_config, metric)
+                self._refresh_user_guidance(effective_config)
                 efficiency_details.append(
                     {
                         "cycle": wave_idx,
@@ -381,12 +1102,12 @@ class SwarmController:
                         "score": round(score, 4),
                     }
                 )
-                self._rotate_topology(config, wave_idx)
-                self._apply_population_control(config)
-                if config.team_mode_enabled:
-                    self._run_team_brainstorm(config, wave_idx)
-                if config.memory_distillation_enabled:
-                    self._run_memory_distillation(config, wave_idx)
+                self._rotate_topology(effective_config, wave_idx)
+                self._apply_population_control(effective_config)
+                if effective_config.team_mode_enabled:
+                    self._run_team_brainstorm(effective_config, wave_idx)
+                if effective_config.memory_distillation_enabled:
+                    self._run_memory_distillation(effective_config, wave_idx)
 
                 previous_tests = self.snapshot.total_tests
 
@@ -442,6 +1163,24 @@ class SwarmController:
         ]
         wave = self.snapshot.wave_name
         tests_path = os.path.join(self.root_dir, "tests", f"test_{wave.lower()}.py")
+        standard_pack = None
+        standard_reference = ""
+        if config.standard_tests_enabled and self.returned_failure_streak >= max(
+            1, config.standard_test_min_returned_failures
+        ):
+            failure_pattern = self._failure_pattern_hint()
+            standard_pack = self.standard_tests.resolve(
+                role="test",
+                code_type=self._infer_code_type(goal.target_files[0]),
+                failure_pattern=failure_pattern,
+                target_file=goal.target_files[0],
+            )
+            standard_reference = standard_pack.render()
+            self.latest_standard_test_reason = (
+                f"Returned failure streak {self.returned_failure_streak} triggered fallback pack "
+                f"for {standard_pack.role}/{standard_pack.code_type}/{standard_pack.failure_pattern}."
+            )
+            self.latest_standard_test_pack = standard_reference[:280]
 
         generated = self.test_bot.generate_next_wave(
             previous_results=[{"last_status": self.last_status}],
@@ -449,8 +1188,26 @@ class SwarmController:
             wave=wave,
             target_file=goal.target_files[0],
             tests_path=tests_path,
+            reference_material=standard_reference,
         )
         approved = self.judge_bot.validate_tests(generated)
+        if standard_pack and standard_reference:
+            generated[0].content = f"{generated[0].content}\n\n{standard_reference}"
+            approved = self.judge_bot.validate_tests(generated)
+            self.standard_test_fallback_count += 1
+            if self.artifacts:
+                self.artifacts.append_event(
+                    "standard_test_pack_used",
+                    {
+                        "wave": wave,
+                        "role": standard_pack.role,
+                        "code_type": standard_pack.code_type,
+                        "failure_pattern": standard_pack.failure_pattern,
+                    },
+                )
+                self.artifacts.append_progress(
+                    f"Standard test fallback pack used for {standard_pack.role}/{standard_pack.code_type}."
+                )
 
         if self.artifacts:
             self.artifacts.append_event(
@@ -460,6 +1217,8 @@ class SwarmController:
                     "generated": len(generated),
                     "approved": len(approved),
                     "previous_tests": previous_tests,
+                    "standard_tests_used": bool(standard_pack),
+                    "returned_failure_streak": self.returned_failure_streak,
                 },
             )
             self.artifacts.append_progress(
@@ -467,6 +1226,38 @@ class SwarmController:
             )
 
         return approved
+
+    def _infer_code_type(self, target_file: str) -> str:
+        name = (target_file or "").lower()
+        if name.endswith(".py"):
+            if os.path.basename(name) in {"app.py", "app_v3.py"}:
+                return "flask"
+            return "python"
+        if name.endswith(".js"):
+            return "javascript"
+        if name.endswith(".ts"):
+            return "typescript"
+        if name.endswith(".cs"):
+            return "csharp"
+        return "generic"
+
+    def _failure_pattern_hint(self) -> str:
+        text = " ".join(
+            [
+                self.last_status,
+                self.last_failure_context,
+                " ".join(self.handoff_feedback_log[-2:]),
+            ]
+        ).lower()
+        if "unknown api" in text or "unknown symbol" in text:
+            return "unknown_api"
+        if "assert" in text or "assertion" in text:
+            return "regression"
+        if "flaky" in text:
+            return "flaky"
+        if "boundary" in text:
+            return "boundary"
+        return "any"
 
     def _build_directive_block(
         self,
@@ -880,9 +1671,11 @@ class SwarmController:
         cfg = config or RunConfig()
         failure_excerpt = (failure_output or "").replace("\n", " ")[:320]
         fix_excerpt = (fix_list or "").replace("\n", " ")[:280]
+        returned_count = 0
         for handoff_id, payload in list(self.open_handoffs.items()):
             if payload.get("status") != "OPEN":
                 continue
+            returned_count += 1
             record = payload.get("record", {})
             parent = record.get("parent_agent", "SwarmController")
             agent = record.get("agent_name", "unknown")
@@ -942,6 +1735,10 @@ class SwarmController:
                     },
                 )
                 self.artifacts.append_progress(note)
+        if returned_count:
+            self.returned_failure_streak += 1
+        else:
+            self.returned_failure_streak = 0
         self.handoff_feedback_log = self.handoff_feedback_log[-10:]
         with self._lock:
             self._save_state()
@@ -961,6 +1758,7 @@ class SwarmController:
                     },
                 )
         self.open_handoffs = {}
+        self.returned_failure_streak = 0
         with self._lock:
             self._save_state()
 
@@ -1065,6 +1863,11 @@ class SwarmController:
                 error_message=judge_output,
                 guidance=guidance,
             )
+        self.agent_memory.invalidate(
+            agent_name=self.coder_agent.name,
+            task_family="implementation",
+            reason=judge_output[:240],
+        )
 
     def _generate_fix_list(self, failure_output: str, config: RunConfig) -> str:
         prompt = (
@@ -1078,6 +1881,14 @@ class SwarmController:
             purpose="fix-list",
             config=config,
         )
+        if response and config.local_memory_enabled:
+            self.agent_memory.inject_solution(
+                agent_name=self.coder_agent.name,
+                task_family="implementation",
+                note=response,
+                source_agent=self.judge_bot.agent.name,
+                reason="judge fix list",
+            )
         return response or failure_output[:1200]
 
     def _safe_generate(
@@ -1086,6 +1897,7 @@ class SwarmController:
         prompt: str,
         purpose: str,
         config: RunConfig,
+        task_family: Optional[str] = None,
     ) -> str:
         working_prompt = prompt
 
@@ -1110,44 +1922,158 @@ class SwarmController:
                         after_chars=len(working_prompt),
                     )
 
-        response = agent.generate(working_prompt)
-        if response and not response.startswith("ERROR:"):
-            return response
+        local_agent = self._is_local_agent(agent)
+        family = (task_family or purpose or "general").strip().lower()
+        memory_recall = None
+        if local_agent and config.local_memory_enabled:
+            support_notes: List[str] = []
+            if self.latest_skill_event:
+                support_notes.append(self.latest_skill_event)
+            if self.handoff_feedback_log:
+                support_notes.extend(self.handoff_feedback_log[-2:])
+            if self.last_failure_context:
+                support_notes.append(self.last_failure_context)
+            if purpose in {"implementation", "fix-pass"} and config.failure_memory_enabled:
+                guidance = self.failure_memory.format_guidance(
+                    working_prompt,
+                    limit=config.failure_memory_limit,
+                )
+                if guidance:
+                    support_notes.append(guidance)
+            memory_recall = self.agent_memory.prepare(
+                agent_name=agent.name,
+                task_family=family,
+                task_prompt=working_prompt,
+                failure_context=self.last_failure_context if purpose != "testing" else "",
+                support_notes=support_notes,
+                force_refresh=not config.local_memory_reuse_enabled,
+                max_chars=config.local_memory_max_chars,
+            )
+            if memory_recall.content:
+                working_prompt = (
+                    f"{working_prompt}\n\nLOCAL MEMORY PACKET ({agent.name}/{family}):\n"
+                    f"{memory_recall.content}"
+                )
+                with self._lock:
+                    self.latest_local_memory_note = memory_recall.note[:280]
+                    self.latest_local_memory_agent = agent.name[:140]
+                    self.latest_local_memory_task_family = family[:140]
+                    self._save_state()
+                if self.artifacts:
+                    self.artifacts.append_event(
+                        "local_memory_primed" if not memory_recall.reused else "local_memory_reused",
+                        {
+                            "agent_name": agent.name,
+                            "task_family": family,
+                            "packet_id": memory_recall.packet_id,
+                            "reused": memory_recall.reused,
+                            "refreshed": memory_recall.refreshed,
+                            "note": memory_recall.note,
+                        },
+                    )
 
-        if not config.prompt_guard_retry_on_error:
-            return response or ""
-
-        failure_context = self.last_failure_context
-        if not failure_context and config.failure_memory_enabled:
-            similar = self.failure_memory.retrieve_similar(prompt, limit=2)
-            if similar:
-                failure_context = "\n".join(
-                    [
-                        f"- error={item.get('error_message', '')[:220]} fix={item.get('fix_summary', '')[:220]}"
-                        for item in similar
-                    ]
+        lease = None
+        if local_agent and config.local_api_throttle_enabled:
+            self.local_governor.configure(
+                max_inflight=config.local_api_max_inflight,
+                min_interval_seconds=config.local_api_min_interval_seconds,
+                queue_limit=config.local_api_queue_limit,
+                backoff_seconds=config.local_api_backoff_seconds,
+            )
+            lane = "user" if purpose.startswith("chat") else "swarm"
+            lease = self.local_governor.acquire(agent.name, family, lane=lane)
+            with self._lock:
+                governor_status = self.local_governor.status()
+                self.local_api_inflight = int(governor_status.get("inflight", 0))
+                self.local_api_throttle_hits = int(governor_status.get("throttle_hits", 0))
+                self.snapshot.local_api_user_waiting = int(governor_status.get("user_waiting", 0))
+                self.snapshot.local_api_swarm_waiting = int(governor_status.get("swarm_waiting", 0))
+                self.snapshot.local_api_last_lane = str(governor_status.get("last_lane", lane))
+                self._save_state()
+            if lease.throttled and self.artifacts:
+                self.artifacts.append_event(
+                    "local_api_throttled",
+                    {
+                        "agent_name": agent.name,
+                        "task_family": family,
+                        "lane": lane,
+                        "waited_seconds": lease.waited_seconds,
+                        "queue_limit": config.local_api_queue_limit,
+                    },
                 )
 
-        retry = self.prompt_guard.refactor_on_failure(
-            prompt=working_prompt,
-            purpose=purpose,
-            failure_message=(response or "empty response"),
-            failure_context=failure_context or "none",
-            max_chars=config.prompt_guard_max_chars,
-        )
-        retry_prompt = retry.prompt
-        with self._lock:
-            self.snapshot.prompt_refactor_count += 1
-            self.snapshot.latest_prompt_guard_note = retry.note
-            self._save_state()
-        if self.artifacts:
-            self.artifacts.append_prompt_guard_event(
-                purpose=f"{purpose}-retry",
-                note=retry.note,
-                before_chars=len(working_prompt),
-                after_chars=len(retry_prompt),
+        response = ""
+        try:
+            response = agent.generate(working_prompt)
+        finally:
+            if lease:
+                self.local_governor.release(lease)
+                with self._lock:
+                    governor_status = self.local_governor.status()
+                    self.local_api_inflight = int(governor_status.get("inflight", 0))
+                    self.local_api_throttle_hits = int(governor_status.get("throttle_hits", 0))
+                    self.snapshot.local_api_user_waiting = int(governor_status.get("user_waiting", 0))
+                    self.snapshot.local_api_swarm_waiting = int(governor_status.get("swarm_waiting", 0))
+                    self.snapshot.local_api_last_lane = str(governor_status.get("last_lane", "swarm"))
+                    self._save_state()
+
+        final_response = response
+        if response and not response.startswith("ERROR:"):
+            final_response = response
+        elif config.prompt_guard_retry_on_error:
+            failure_context = self.last_failure_context
+            if not failure_context and config.failure_memory_enabled:
+                similar = self.failure_memory.retrieve_similar(prompt, limit=2)
+                if similar:
+                    failure_context = "\n".join(
+                        [
+                            f"- error={item.get('error_message', '')[:220]} fix={item.get('fix_summary', '')[:220]}"
+                            for item in similar
+                        ]
+                    )
+
+            retry = self.prompt_guard.refactor_on_failure(
+                prompt=working_prompt,
+                purpose=purpose,
+                failure_message=(response or "empty response"),
+                failure_context=failure_context or "none",
+                max_chars=config.prompt_guard_max_chars,
             )
-        return agent.generate(retry_prompt) or ""
+            retry_prompt = retry.prompt
+            with self._lock:
+                self.snapshot.prompt_refactor_count += 1
+                self.snapshot.latest_prompt_guard_note = retry.note
+                self._save_state()
+            if self.artifacts:
+                self.artifacts.append_prompt_guard_event(
+                    purpose=f"{purpose}-retry",
+                    note=retry.note,
+                    before_chars=len(working_prompt),
+                    after_chars=len(retry_prompt),
+                )
+            final_response = agent.generate(retry_prompt) or ""
+
+        if memory_recall:
+            success = bool(final_response and not final_response.startswith("ERROR:"))
+            self.agent_memory.record_call(
+                agent_name=agent.name,
+                task_family=family,
+                packet_id=memory_recall.packet_id,
+                success=success,
+                outcome="success" if success else "failure",
+                reused=memory_recall.reused,
+                note=purpose,
+            )
+            if not success and config.local_memory_invalidate_on_failure:
+                self.agent_memory.invalidate(
+                    agent_name=agent.name,
+                    task_family=family,
+                    reason=f"{purpose} call failed or returned empty response",
+                )
+        return final_response or ""
+
+    def _is_local_agent(self, agent: SimpleAgent) -> bool:
+        return bool(getattr(agent, "is_local", False))
 
     def _run_hallucination_guard(
         self,
@@ -1210,6 +2136,14 @@ class SwarmController:
                         + "; ".join(result.alerts[:3])
                     ),
                     fix_list="Replace unknown symbols/APIs with project-defined alternatives.",
+                )
+            if config.local_memory_enabled:
+                self.agent_memory.inject_solution(
+                    agent_name=self.coder_agent.name,
+                    task_family="implementation",
+                    note="Replace unknown symbols/APIs with project-defined alternatives.",
+                    source_agent="HallucinationGuard",
+                    reason="blocked low-confidence cycle",
                 )
             return False
         return True
@@ -1457,6 +2391,46 @@ class SwarmController:
     def _refresh_user_guidance(self, config: RunConfig) -> None:
         suggestions: List[str] = []
         warnings: List[str] = []
+
+        if self.snapshot.state == RunState.PREPARING and self.preflight_bundle:
+            if self.preflight_bundle.ready_to_launch:
+                suggestions.append(
+                    "Preflight bundle is approved. Use /launch to start the swarm."
+                )
+            else:
+                pending = [
+                    item.agent_name
+                    for item in self.preflight_bundle.proposals
+                    if item.status == "PENDING"
+                ]
+                revises = [
+                    item.agent_name
+                    for item in self.preflight_bundle.proposals
+                    if item.status == "REVISE"
+                ]
+                denied = [
+                    item.agent_name
+                    for item in self.preflight_bundle.proposals
+                    if item.status == "DENIED"
+                ]
+                if pending:
+                    warnings.append(
+                        "Preflight review pending for: " + ", ".join(pending[:5])
+                    )
+                if revises:
+                    warnings.append(
+                        "Preflight proposals need revision: " + ", ".join(revises[:5])
+                    )
+                if denied:
+                    warnings.append(
+                        "Preflight proposals were denied: " + ", ".join(denied[:5])
+                    )
+                suggestions.append(
+                    "Approve or revise the prep proposals, then use /launch when ready."
+                )
+                suggestions.append(
+                    "Use /approve <agent>, /deny <agent>, or /revise <agent> with a short note."
+                )
 
         if self.snapshot.hallucination_confidence < config.hallucination_alert_threshold:
             warnings.append(

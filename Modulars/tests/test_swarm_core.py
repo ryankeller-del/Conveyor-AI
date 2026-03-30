@@ -5,6 +5,10 @@ from swarm_core.bots import JudgeBot, SimpleAgent
 from swarm_core.compaction import DistillationLoop
 from swarm_core.controller import SwarmController
 from swarm_core.efficiency import EfficiencyAnalyzer
+from swarm_core.local_runtime import AgentMemoryManager, LocalCallGovernor
+from swarm_core.rehearsal import OfflineRehearsalManager, stage_manifest_from_snapshot
+from swarm_core.preflight import SwarmPreflightManager
+from swarm_core.standard_tests import StandardTestLibrary
 from swarm_core.rosetta import RosettaStone
 from swarm_core.skill_evolution import SkillEvolutionManager
 from swarm_core.spawn import AgentDescriptor, AgentRegistry, SpawnManager
@@ -62,6 +66,42 @@ class _FallbackClient:
         completions = _Completions()
 
     chat = _Chat()
+
+
+class _SelectiveClient:
+    def __init__(self):
+        self.calls = []
+
+    class _Chat:
+        def __init__(self, outer):
+            self._outer = outer
+
+        class _Completions:
+            def __init__(self, outer):
+                self._outer = outer
+
+            def create(self, **kwargs):
+                model = kwargs.get("model", "")
+                self._outer.calls.append(model)
+
+                class _Msg:
+                    content = "" if model == "primary-model" else "fallback-hit"
+
+                class _Choice:
+                    message = _Msg()
+
+                class _Resp:
+                    choices = [_Choice()]
+
+                return _Resp()
+
+        @property
+        def completions(self):
+            return self._Completions(self._outer)
+
+    @property
+    def chat(self):
+        return self._Chat(self)
 
 
 def _agent(name):
@@ -187,6 +227,12 @@ def test_controller_status_has_wave_topology_and_recommendation(tmp_path: Path):
     assert "active_skill_count" in status
     assert "skill_retool_count" in status
     assert "latest_skill_event" in status
+    assert "local_memory_packet_count" in status
+    assert "local_memory_reuse_count" in status
+    assert "local_memory_invalidations" in status
+    assert "local_api_inflight" in status
+    assert "local_api_throttle_hits" in status
+    assert "latest_local_memory_note" in status
 
 
 def test_team_comparison_and_brainstorm_detects_novel_signatures(tmp_path: Path):
@@ -215,6 +261,107 @@ def test_simple_agent_uses_fallback_client_when_primary_unavailable():
     )
     content = agent.generate("write code")
     assert content == "fallback-response"
+
+
+def test_simple_agent_uses_fallback_models_in_order():
+    client = _SelectiveClient()
+    agent = SimpleAgent(
+        name="coder",
+        system_prompt="",
+        client=client,
+        model="primary-model",
+        fallback_models=["fallback-model", "backup-model"],
+    )
+    content = agent.generate("write code")
+    assert content == "fallback-hit"
+    assert client.calls[:2] == ["primary-model", "fallback-model"]
+
+
+def test_agent_memory_manager_reuses_and_refreshes_packets(tmp_path: Path):
+    manager = AgentMemoryManager(str(tmp_path / "agent_memory"))
+    first = manager.prepare(
+        agent_name="LocalCoder",
+        task_family="implementation",
+        task_prompt="Build a small API.",
+        failure_context="",
+        support_notes=["Prefer small edits."],
+    )
+    assert first.content
+    second = manager.prepare(
+        agent_name="LocalCoder",
+        task_family="implementation",
+        task_prompt="Build a small API.",
+    )
+    assert second.reused is True
+    manager.inject_solution(
+        agent_name="LocalCoder",
+        task_family="implementation",
+        note="Add null checks before returning.",
+        source_agent="JudgeBot",
+        reason="failure analysis",
+    )
+    third = manager.prepare(
+        agent_name="LocalCoder",
+        task_family="implementation",
+        task_prompt="Build a small API.",
+    )
+    assert third.reused is False
+    assert "JudgeBot" in third.content
+    assert manager.status()["reuse_count"] >= 1
+    assert manager.status()["invalidations"] >= 1
+
+
+def test_agent_memory_manager_exposes_specialist_profiles(tmp_path: Path):
+    manager = AgentMemoryManager(str(tmp_path / "agent_memory"))
+    packet = manager.prepare(
+        agent_name="LocalCoder",
+        task_family="implementation",
+        task_prompt="Build a small API.",
+        support_notes=["Prefer small edits."],
+    )
+    manager.record_call(
+        agent_name="LocalCoder",
+        task_family="implementation",
+        packet_id=packet.packet_id,
+        success=True,
+        outcome="success",
+        reused=False,
+        note="implementation",
+    )
+    profiles = manager.specialist_profiles()
+    assert profiles
+    profile = profiles[0]
+    assert profile["agent_name"] == "LocalCoder"
+    assert profile["task_family"] == "implementation"
+    assert "current_expert_trend" in profile
+    assert profile["current_expert_trend"] in {"forming", "stable", "strengthening", "emerging"}
+
+
+def test_standard_test_library_resolves_role_and_failure_patterns():
+    library = StandardTestLibrary()
+    pack = library.resolve(
+        role="test",
+        code_type="flask",
+        failure_pattern="unknown_api",
+        target_file="app_v3.py",
+    )
+    rendered = pack.render()
+    assert pack.role == "test"
+    assert pack.code_type == "flask"
+    assert "Standard fallback tests" in rendered
+    assert "app_v3" in rendered
+
+
+def test_local_governor_throttles_back_to_back_calls():
+    governor = LocalCallGovernor(max_inflight=1, min_interval_seconds=0.01, queue_limit=1, backoff_seconds=0.01)
+    lease = governor.acquire("LocalCoder", "implementation")
+    governor.release(lease)
+    second = governor.acquire("LocalCoder", "implementation")
+    try:
+        assert second.throttled is True
+        assert governor.status()["throttle_hits"] >= 1
+    finally:
+        governor.release(second)
 
 
 def test_spawn_manager_blocks_when_cooldown_violation():
@@ -379,6 +526,44 @@ def test_handoff_mismatch_learning_increments_counter(tmp_path: Path):
     assert controller.handoff_mismatch_count >= 1
 
 
+def test_standard_tests_are_offered_after_returned_failure_streak(tmp_path: Path):
+    controller = SwarmController(
+        test_agent=_agent("test"),
+        coder_agent=_agent("coder"),
+        judge_agent=_agent("judge"),
+        root_dir=str(tmp_path),
+    )
+    controller.returned_failure_streak = 2
+    captured = {}
+
+    def _stub_generate_next_wave(**kwargs):
+        captured["reference_material"] = kwargs.get("reference_material", "")
+        path = kwargs["tests_path"]
+        return [
+            TestSpec(
+                name="baseline",
+                wave=kwargs["wave"],
+                content="def test_generated():\n    assert True\n",
+                path=path,
+            )
+        ]
+
+    controller.test_bot.generate_next_wave = _stub_generate_next_wave  # type: ignore[method-assign]
+    controller.judge_bot.validate_tests = lambda specs: specs
+    cfg = RunConfig(
+        standard_tests_enabled=True,
+        standard_test_min_returned_failures=2,
+    )
+    generated = controller._generate_wave_tests(
+        TaskGoal(prompt="build api", target_files=["app_v3.py"], language="general"),
+        cfg,
+        previous_tests=0,
+    )
+    assert captured["reference_material"]
+    assert "Standard fallback tests" in generated[0].content
+    assert controller.standard_test_fallback_count == 1
+
+
 def test_quality_gate_marks_failed_when_no_passes(tmp_path: Path):
     controller = SwarmController(
         test_agent=_agent("test"),
@@ -489,3 +674,161 @@ def test_skill_evolution_promotes_and_retools():
     )
     event2 = manager.evaluate(snapshot=snap2, metric=metric2, config=cfg)
     assert event2 is not None and event2.action == "RETOOL"
+
+
+def test_preflight_bundle_builds_advisory_proposals(tmp_path: Path):
+    manager = SwarmPreflightManager(
+        root_dir=str(tmp_path),
+        seed_agent=_agent("seed"),
+        directive_agent=_agent("directive"),
+        stability_agent=_agent("stability"),
+    )
+    bundle = manager.build_bundle(
+        goal=TaskGoal(prompt="prepare safe launch", target_files=["app_v3.py"], language="general"),
+        config=RunConfig(),
+    )
+
+    assert len(bundle.proposals) == 3
+    assert bundle.status in {"PENDING", "APPROVED", "REVISE", "READY"}
+    assert bundle.requested_tools
+    assert bundle.requested_updates
+    assert "pytest" in bundle.requested_tools
+    assert "coverage" in bundle.requested_tools
+    assert "dry-run harness" in bundle.requested_tools
+    assert "spawn report" in bundle.requested_tools
+    assert "efficiency report" in bundle.requested_tools
+    assert "log inspection" in bundle.requested_tools
+    assert "artifact browser" in bundle.requested_tools
+    for proposal in bundle.proposals:
+        assert proposal.suggested_action
+        assert proposal.expected_benefit
+        assert proposal.risk_if_wrong
+        assert proposal.validation_plan
+        assert proposal.status in {"APPROVED", "REVISE", "DENIED"}
+
+    prep_dir = tmp_path / "swarm_runs" / "preflight" / bundle.bundle_id
+    assert (prep_dir / "prep_bundle.json").exists()
+    assert (prep_dir / "prep_bundle.md").exists()
+
+
+def test_preflight_bundle_autoreviews_without_manual_approval(tmp_path: Path):
+    controller = SwarmController(
+        test_agent=_agent("test"),
+        coder_agent=_agent("coder"),
+        judge_agent=_agent("judge"),
+        root_dir=str(tmp_path),
+    )
+    controller.judge_bot.run_tests_with_command = (
+        lambda tests_path, cwd, command_template: (True, "ok")
+    )
+    goal = TaskGoal(prompt="prepare the swarm", target_files=["app_v3.py"], language="general")
+    cfg = RunConfig(max_waves=1, max_total_tests=4)
+    run_id = controller.start(goal, cfg)
+
+    assert run_id
+    state = _wait_for_terminal(controller)
+    status = controller.status()
+    assert state == "COMPLETE"
+    assert status["prep_ready_to_launch"] is True
+    assert status["prep_status"] == "READY"
+    assert status["prep_requested_tools"]
+    assert status["prep_requested_updates"]
+    assert "pytest" in status["prep_requested_tools"]
+    assert "coverage" in status["prep_requested_tools"]
+    assert "dry-run harness" in status["prep_required_testing_tools"]
+    assert "spawn report" in status["prep_required_reporting_tools"]
+    assert "log inspection" in status["prep_required_diagnostics_tools"]
+
+
+def test_offline_rehearsal_generates_manifest_and_report(tmp_path: Path):
+    controller = SwarmController(
+        test_agent=_agent("test"),
+        coder_agent=_agent("coder"),
+        judge_agent=_agent("judge"),
+        root_dir=str(tmp_path),
+    )
+    controller.snapshot.run_id = "live-001"
+    controller.snapshot.wave_name = "IMPLEMENT"
+    controller.snapshot.total_tests = 5
+    controller.snapshot.passing_tests = 4
+    controller.snapshot.hallucination_confidence = 0.92
+    live_manifest = stage_manifest_from_snapshot(
+        controller.snapshot,
+        RunConfig(),
+        current_stage="IMPLEMENT",
+        next_stage="JUDGE",
+        source="live",
+        profile="live",
+    )
+    controller.live_stage_manifest = live_manifest
+
+    manager = OfflineRehearsalManager(str(tmp_path))
+    outcome = manager.simulate(
+        snapshot=controller.snapshot,
+        config=RunConfig(stage_manifest_min_score_delta=0.01),
+        profile="healthy",
+        live_manifest=live_manifest,
+    )
+
+    assert outcome.report_path and Path(outcome.report_path).exists()
+    assert outcome.manifest_path and Path(outcome.manifest_path).exists()
+    assert outcome.trace_path and Path(outcome.trace_path).exists()
+    assert outcome.manifest.current_stage
+    assert outcome.manifest.next_stage
+    assert outcome.stage_timeline
+    assert outcome.rehearsal_score >= outcome.live_score
+
+
+def test_live_controller_accepts_better_stage_manifest_without_restart(tmp_path: Path):
+    controller = SwarmController(
+        test_agent=_agent("test"),
+        coder_agent=_agent("coder"),
+        judge_agent=_agent("judge"),
+        root_dir=str(tmp_path),
+    )
+    controller.snapshot.run_id = "live-002"
+    controller.snapshot.wave_name = "TEST_WAVE_GEN"
+    controller.snapshot.total_tests = 4
+    controller.snapshot.passing_tests = 2
+    controller.snapshot.hallucination_confidence = 0.6
+    controller.active_run_config = RunConfig(stage_manifest_min_score_delta=0.01)
+    controller.live_stage_manifest = stage_manifest_from_snapshot(
+        controller.snapshot,
+        controller.active_run_config,
+        current_stage="TEST_WAVE_GEN",
+        next_stage="IMPLEMENT",
+        source="live",
+        profile="live",
+        score_override=0.25,
+    )
+
+    better_manifest = stage_manifest_from_snapshot(
+        controller.snapshot,
+        controller.active_run_config,
+        current_stage="STABILIZATION",
+        next_stage="REPORTING",
+        source="rehearsal",
+        profile="mixed",
+        score_override=0.75,
+        note="Hot-swap candidate",
+    )
+    accepted = controller.apply_stage_manifest(better_manifest)
+    assert accepted is True
+    assert controller.live_stage_manifest.current_stage == "STABILIZATION"
+    assert controller.snapshot.stage_manifest_current == "STABILIZATION"
+    assert controller.snapshot.stage_manifest_next == "REPORTING"
+    assert controller.snapshot.stage_manifest_score == 0.75
+
+    worse_manifest = stage_manifest_from_snapshot(
+        controller.snapshot,
+        controller.active_run_config,
+        current_stage="IMPLEMENT",
+        next_stage="JUDGE",
+        source="rehearsal",
+        profile="stress",
+        score_override=0.10,
+        note="Worse candidate",
+    )
+    rejected = controller.apply_stage_manifest(worse_manifest)
+    assert rejected is False
+    assert controller.live_stage_manifest.current_stage == "STABILIZATION"

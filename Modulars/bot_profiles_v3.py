@@ -73,6 +73,21 @@ def build_profiles(stack: str) -> Dict[str, BotProfile]:
 
 
 def build_swarm_profiles() -> Dict[str, BotProfile]:
+    coder_local_fallbacks = [
+        "qwen2.5-coder:7b",
+        "qwen2.5-coder:3b",
+        "gpt-oss:20b",
+    ]
+    reasoning_local_fallbacks = [
+        "gpt-oss:20b",
+        "phi4:latest",
+        "qwen2.5-coder:7b",
+    ]
+    chat_local_fallbacks = [
+        "phi4:latest",
+        "qwen2.5-coder:7b",
+        "qwen2.5-coder:3b",
+    ]
     return {
         "test": BotProfile(
             name="TestBot",
@@ -86,7 +101,7 @@ def build_swarm_profiles() -> Dict[str, BotProfile]:
         "coder": BotProfile(
             name="LocalCoder",
             model="qwen2.5-coder:14b",
-            fallback_models=[],
+            fallback_models=list(coder_local_fallbacks),
             system_prompt=(
                 "Write efficient production code that passes given tests. "
                 "Return raw code only."
@@ -95,15 +110,30 @@ def build_swarm_profiles() -> Dict[str, BotProfile]:
         "judge": BotProfile(
             name="JudgeBot",
             model="qwen2.5-coder:14b",
-            fallback_models=[],
+            fallback_models=list(reasoning_local_fallbacks),
             system_prompt=(
                 "Summarize test failures into specific fix steps and likely root cause."
+            ),
+        ),
+        "chat": BotProfile(
+            name="LocalChatBot",
+            model="gpt-oss:20b",
+            fallback_models=list(chat_local_fallbacks),
+            system_prompt=(
+                "You are LocalChatBot, the user's priority local assistant for this swarm. "
+                "Return JSON only with keys reply, background_instruction, swarm_health, and mode. "
+                "Mode will be one of chat, health, or architect. "
+                "If mode is chat, answer conversationally and keep the reply short. "
+                "If mode is health, summarize swarm health, blockers, and the next useful action. "
+                "If mode is architect, provide a concise instruction for the main swarm architect "
+                "and a short user-facing reply. "
+                "Keep background_instruction compact and actionable."
             ),
         ),
         "context_guard": BotProfile(
             name="ContextGuardBot",
             model="qwen2.5-coder:14b",
-            fallback_models=[],
+            fallback_models=list(reasoning_local_fallbacks),
             system_prompt=(
                 "You are a high-level prompt strategist. "
                 "Refactor complex prompts into concise, staged, low-ambiguity instructions. "
@@ -113,7 +143,7 @@ def build_swarm_profiles() -> Dict[str, BotProfile]:
         "pattern_finder": BotProfile(
             name="PatternFinder",
             model="qwen2.5-coder:14b",
-            fallback_models=[],
+            fallback_models=list(reasoning_local_fallbacks),
             system_prompt=(
                 "Analyze failures and progress logs, then extract compact recurring engineering rules."
             ),
@@ -121,7 +151,7 @@ def build_swarm_profiles() -> Dict[str, BotProfile]:
         "compression": BotProfile(
             name="CompressionBot",
             model="qwen2.5-coder:14b",
-            fallback_models=[],
+            fallback_models=list(reasoning_local_fallbacks),
             system_prompt=(
                 "Compress context into high-signal memory with minimal token overhead."
             ),
@@ -129,7 +159,7 @@ def build_swarm_profiles() -> Dict[str, BotProfile]:
         "novelty": BotProfile(
             name="NoveltyBot",
             model="qwen2.5-coder:14b",
-            fallback_models=[],
+            fallback_models=list(reasoning_local_fallbacks),
             system_prompt=(
                 "Propose novel but practical architecture or prompt breadcrumbs to avoid stagnation."
             ),
@@ -137,10 +167,43 @@ def build_swarm_profiles() -> Dict[str, BotProfile]:
         "stability_guard": BotProfile(
             name="StabilityGuardBot",
             model="qwen2.5-coder:14b",
-            fallback_models=[],
+            fallback_models=list(reasoning_local_fallbacks),
             system_prompt=(
                 "You are a swarm stability controller. Detect collapse trends and return concise "
                 "stabilization objectives that reduce retries, open handoffs, and agent churn."
+            ),
+        ),
+        "seed_prep": BotProfile(
+            name="SeedPrepBot",
+            model="qwen2.5-coder:14b",
+            fallback_models=list(reasoning_local_fallbacks),
+            system_prompt=(
+                "You are an advisory preflight planner. "
+                "Return JSON only with title, suggested_action, expected_benefit, risk_if_wrong, "
+                "validation_plan, config_overrides, requested_tools, and requested_updates. "
+                "Do not write code. Focus on compact seed data for analyzers and testing grounds."
+            ),
+        ),
+        "directive_prep": BotProfile(
+            name="DirectivePrepBot",
+            model="qwen2.5-coder:14b",
+            fallback_models=list(reasoning_local_fallbacks),
+            system_prompt=(
+                "You are an advisory preflight planner. "
+                "Return JSON only with title, suggested_action, expected_benefit, risk_if_wrong, "
+                "validation_plan, config_overrides, requested_tools, and requested_updates. "
+                "Do not write code. Focus on concise directives, approval gating, and need-to-know handoffs."
+            ),
+        ),
+        "stability_prep": BotProfile(
+            name="StabilityPrepBot",
+            model="qwen2.5-coder:14b",
+            fallback_models=list(reasoning_local_fallbacks),
+            system_prompt=(
+                "You are an advisory preflight planner. "
+                "Return JSON only with title, suggested_action, expected_benefit, risk_if_wrong, "
+                "validation_plan, config_overrides, requested_tools, and requested_updates. "
+                "Do not write code. Focus on collapse prevention, population control, and launch safety."
             ),
         ),
     }

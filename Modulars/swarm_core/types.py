@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 
 class RunState(str, Enum):
     IDLE = "IDLE"
+    PREPARING = "PREPARING"
     RUNNING = "RUNNING"
     PAUSED = "PAUSED"
     STOPPING = "STOPPING"
@@ -16,6 +17,7 @@ class RunState(str, Enum):
 
 
 class ControllerPhase(str, Enum):
+    PREPARING = "PREPARING"
     TEST_WAVE_GEN = "TEST_WAVE_GEN"
     IMPLEMENT = "IMPLEMENT"
     HALLUCINATION_GUARD = "HALLUCINATION_GUARD"
@@ -39,6 +41,46 @@ class TestSpec:
     content: str
     path: str
     deterministic: bool = True
+
+
+@dataclass
+class StageManifest:
+    manifest_id: str
+    created_at: str
+    source: str
+    profile: str
+    current_stage: str
+    next_stage: str
+    stage_index: int
+    preload_bundle: List[str] = field(default_factory=list)
+    required_tools: List[str] = field(default_factory=list)
+    report_checklist: List[str] = field(default_factory=list)
+    guard_overrides: Dict[str, object] = field(default_factory=dict)
+    runtime_overrides: Dict[str, object] = field(default_factory=dict)
+    score: float = 0.0
+    pass_rate: float = 0.0
+    retries_per_test: float = 0.0
+    open_handoffs: int = 0
+    hallucination_confidence: float = 1.0
+    stage_completion_confidence: float = 1.0
+    note: str = ""
+
+
+@dataclass
+class RehearsalOutcome:
+    rehearsal_id: str
+    profile: str
+    accepted: bool
+    live_score: float
+    rehearsal_score: float
+    manifest: StageManifest
+    stage_timeline: List[Dict[str, object]] = field(default_factory=list)
+    failure_trace: List[str] = field(default_factory=list)
+    report_path: str = ""
+    manifest_path: str = ""
+    manifest_markdown_path: str = ""
+    trace_path: str = ""
+    duration_seconds: float = 0.0
 
 
 @dataclass
@@ -109,6 +151,21 @@ class RunConfig:
     max_compaction_interval_waves: int = 8
     memory_rule_limit: int = 6
     memory_breadcrumb_limit: int = 5
+    local_memory_enabled: bool = True
+    local_memory_reuse_enabled: bool = True
+    local_memory_max_chars: int = 1800
+    local_memory_invalidate_on_failure: bool = True
+    local_api_throttle_enabled: bool = True
+    local_api_max_inflight: int = 1
+    local_api_min_interval_seconds: float = 0.35
+    local_api_queue_limit: int = 2
+    local_api_backoff_seconds: float = 0.2
+    chat_history_limit: int = 25
+    chat_user_priority_enabled: bool = True
+    standard_tests_enabled: bool = True
+    standard_test_min_returned_failures: int = 2
+    standard_test_advisory_only: bool = True
+    specialist_profile_limit: int = 6
     directive_mode_enabled: bool = True
     max_problem_scope_chars: int = 1200
     enforce_no_duplicate_code: bool = True
@@ -139,6 +196,15 @@ class RunConfig:
     skill_min_evidence_count: int = 3
     skill_negative_delta_threshold: float = -0.08
     skill_retool_cooldown_waves: int = 2
+    preflight_enabled: bool = True
+    preflight_required_before_run: bool = False
+    preflight_max_proposals: int = 3
+    preflight_approval_required: bool = True
+    preflight_validation_required: bool = True
+    stage_manifest_hot_swap_enabled: bool = True
+    stage_manifest_min_score_delta: float = 0.05
+    rehearsal_enabled: bool = True
+    rehearsal_profile: str = "balanced"
 
 
 @dataclass
@@ -181,6 +247,26 @@ class RunSnapshot:
     latest_memory_winner: str = ""
     latest_breadcrumb: str = ""
     compaction_interval_active: int = 5
+    local_memory_packet_count: int = 0
+    local_memory_reuse_count: int = 0
+    local_memory_invalidations: int = 0
+    local_api_inflight: int = 0
+    local_api_throttle_hits: int = 0
+    local_api_user_waiting: int = 0
+    local_api_swarm_waiting: int = 0
+    local_api_last_lane: str = "swarm"
+    latest_local_memory_note: str = ""
+    latest_local_memory_agent: str = ""
+    latest_local_memory_task_family: str = ""
+    returned_failure_streak: int = 0
+    standard_test_fallback_count: int = 0
+    latest_standard_test_reason: str = ""
+    latest_standard_test_pack: str = ""
+    specialist_profiles: List[Dict[str, object]] = field(default_factory=list)
+    chat_mode: str = "chat"
+    chat_turn_count: int = 0
+    queued_architect_instruction_count: int = 0
+    latest_architect_instruction: str = ""
     ui_suggestions: List[str] = field(default_factory=list)
     ui_warnings: List[str] = field(default_factory=list)
     directives_active: bool = True
@@ -201,3 +287,23 @@ class RunSnapshot:
     active_skill_count: int = 0
     skill_retool_count: int = 0
     latest_skill_event: str = ""
+    prep_bundle_id: str = ""
+    prep_status: str = "NONE"
+    prep_pending_count: int = 0
+    prep_approved_count: int = 0
+    prep_denied_count: int = 0
+    prep_revise_count: int = 0
+    prep_last_validation: str = ""
+    stage_manifest_id: str = ""
+    stage_manifest_source: str = ""
+    stage_manifest_profile: str = ""
+    stage_manifest_current: str = ""
+    stage_manifest_next: str = ""
+    stage_manifest_score: float = 0.0
+    stage_manifest_note: str = ""
+    rehearsal_id: str = ""
+    rehearsal_state: str = "IDLE"
+    rehearsal_profile: str = ""
+    rehearsal_report_path: str = ""
+    rehearsal_manifest_path: str = ""
+    rehearsal_trace_path: str = ""

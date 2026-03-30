@@ -20,6 +20,7 @@ class SimpleAgent:
     fallback_models: List[str] = None
     fallback_client: object = None
     fallback_client_models: List[str] = None
+    is_local: bool = False
 
     def generate(self, prompt: str) -> str:
         primary_models = [self.model] + list(self.fallback_models or [])
@@ -74,6 +75,7 @@ class TestBot:
         wave: str,
         target_file: str,
         tests_path: str,
+        reference_material: str = "",
     ) -> List[TestSpec]:
         prompt = (
             "Return JSON array of deterministic test specs with keys name and body. "
@@ -81,6 +83,12 @@ class TestBot:
             "Prioritize boundary conditions, untested branches, error handling, and regressions. "
             f"Coverage gaps: {coverage_gaps}. Previous failures: {previous_results}."
         )
+        if reference_material.strip():
+            prompt += (
+                "\n\nReference standard tests are available as backup input only. "
+                "Do not replace your own generated tests with them.\n"
+                f"{reference_material[:3200]}"
+            )
         if self.prompt_guard:
             result = self.prompt_guard.guard_prompt(
                 prompt=prompt,

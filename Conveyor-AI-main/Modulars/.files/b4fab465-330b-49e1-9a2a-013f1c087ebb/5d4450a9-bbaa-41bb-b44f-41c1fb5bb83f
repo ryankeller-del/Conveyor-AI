@@ -1,0 +1,173 @@
+```python
+import os
+import sys
+import chainlit as cl
+
+# Environment Discovery Function
+def discover_project_stack():
+    """
+    Scans the current folder for .cs, .py, or .js files to determine project stack.
+    Returns: A string indicating the project type ('Unity', 'Python', 'Web', or 'Unknown')
+    """
+    current_dir = os.getcwd()
+    file_extensions = ['.cs', '.py', '.js']
+    project_types = {'Unity': 0, 'Python': 0, 'Web': 0}
+    
+    for root, _, files in os.walk(current_dir):
+        for file in files:
+            if any(file.endswith(ext) for ext in file_extensions):
+                if file.endswith('.cs'):
+                    project_types['Unity'] += 1
+                elif file.endswith('.py'):
+                    project_types['Python'] += 1
+                elif file.endswith('.js'):
+                    project_types['Web'] += 1
+    
+    # Determine the dominant project type
+    max_count = max(project_types.values())
+    if max_count == 0:
+        return 'Unknown'
+    
+    for project_type, count in project_types.items():
+        if count == max_count:
+            return project_type
+
+# Null-safe generation wrapper for modular_belt.py compatibility
+def safe_generate(agent, *args, **kwargs):
+    """
+    Null-safe wrapper for Agent.generate method to prevent UI crashes.
+    """
+    try:
+        if hasattr(agent, 'generate') and callable(agent.generate):
+            return agent.generate(*args, **kwargs)
+        else:
+            return "Error: Agent does not have a generate method"
+    except Exception as e:
+        return f"Error in generation: {str(e)}"
+
+# Agent Definitions
+class ScoutBot:
+    """
+    Technical Architect that refines research queries based on discovered stack.
+    """
+    def __init__(self, project_stack):
+        self.project_stack = project_stack
+    
+    def refine_query(self, query):
+        """
+        Refine the research query based on the project stack.
+        """
+        stack_specific_context = {
+            'Unity': f"Unity game development with C# scripting, UnityEditor, and Unity APIs",
+            'Python': f"Python development with relevant frameworks and libraries",
+            'Web': f"Web development with JavaScript, HTML, and relevant frameworks",
+            'Unknown': f"General software development"
+        }
+        
+        context = stack_specific_context.get(self.project_stack, stack_specific_context['Unknown'])
+        refined_query = f"{query}. Context: {context}. Provide information specific to {self.project_stack} development if applicable."
+        
+        return refined_query
+
+class LoaderBot:
+    """
+    Uses Perplexity for live internet research.
+    """
+    def __init__(self):
+        # In a real implementation, we would set up the Perplexity API here
+        self.api_key = os.getenv('PERPLEXITY_API_KEY', '')
+    
+    async def research(self, query):
+        """
+        Conduct research using Perplexity API.
+        """
+        # In a real implementation, we would make an API call to Perplexity
+        # For now, we'll simulate the response
+        if not self.api_key:
+            return "Perplexity API key not found. Please set the PERPLEXITY_API_KEY environment variable."
+        
+        # Simulated response
+        response = f"Research results for: {query}\n\nThis is a simulated response. In a real implementation, this would connect to the Perplexity API to fetch live research results."
+        
+        return response
+
+class LocalCoder:
+    """
+    Systems Engineer that adapts coding style to the project stack.
+    """
+    def __init__(self, project_stack):
+        self.project_stack = project_stack
+    
+    def generate(self, prompt):
+        """
+        Generate code adapted to the project stack with null-safe logic.
+        """
+        try:
+            # In a real implementation, this would use a language model to generate code
+            # For now, we'll simulate the response
+            code_templates = {
+                'Unity': f"// Unity C# code generated for: {prompt}\n// This would be actual Unity C# code in a real implementation\npublic class GeneratedClass : MonoBehaviour {{\n    // Unity-specific code would go here\n}}",
+                'Python': f"# Python code generated for: {prompt}\n# This would be actual Python code in a real implementation\ndef generated_function():\n    # Python-specific code would go here\n    pass",
+                'Web': f"// JavaScript code generated for: {prompt}\n// This would be actual JavaScript code in a real implementation\nfunction generatedFunction() {{\n    // Web-specific code would go here\n}}",
+                'Unknown': f"# Generated code for: {prompt}\n# Project type unknown, providing generic code structure\nclass GeneratedClass:\n    def __init__(self):\n        pass"
+            }
+            
+            generated_code = code_templates.get(self.project_stack, code_templates['Unknown'])
+            return generated_code
+        except Exception as e:
+            return f"Error generating code: {str(e)}"
+
+# Chainlit Application Setup
+@cl.on_chat_start
+async def start_chat():
+    """
+    Initialize the chat and display 'Shadow Factory Online' message.
+    """
+    # Discover project stack
+    project_stack = discover_project_stack()
+    
+    # Initialize agents
+    scout_bot = ScoutBot(project_stack)
+    loader_bot = LoaderBot()
+    local_coder = LocalCoder(project_stack)
+    
+    # Store agents in session for later use
+    cl.user_session.set("scout_bot", scout_bot)
+    cl.user_session.set("loader_bot", loader_bot)
+    cl.user_session.set("local_coder", local_coder)
+    cl.user_session.set("project_stack", project_stack)
+    
+    # Send welcome message
+    welcome_message = f"Shadow Factory Online\n\nDetected project stack: {project_stack}\n\nAvailable commands:\n- research [query]: Conduct research\n- code [prompt]: Generate code"
+    await cl.Message(content=welcome_message).send()
+
+@cl.on_message
+async def main(message: str):
+    """
+    Handle incoming messages and route to appropriate agents.
+    """
+    # Get agents from session
+    scout_bot = cl.user_session.get("scout_bot")
+    loader_bot = cl.user_session.get("loader_bot")
+    local_coder = cl.user_session.get("local_coder")
+    project_stack = cl.user_session.get("project_stack")
+    
+    # Process message based on content
+    if message.lower().startswith("research"):
+        query = message[8:].strip()
+        refined_query = scout_bot.refine_query(query)
+        research_result = await loader_bot.research(refined_query)
+        await cl.Message(content=research_result).send()
+    elif message.lower().startswith("code"):
+        prompt = message[5:].strip()
+        # Use safe_generate wrapper
+        generated_code = safe_generate(local_coder, prompt)
+        await cl.Message(content=f"```{generated_code}```").send()
+    else:
+        await cl.Message(content="Unknown command. Try 'research [query]' or 'code [prompt]'").send()
+
+if __name__ == "__main__":
+    # Get port from command line arguments or default to 8000
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
+    chainlit.run(app_path="app_v2.py", port=port)
+```

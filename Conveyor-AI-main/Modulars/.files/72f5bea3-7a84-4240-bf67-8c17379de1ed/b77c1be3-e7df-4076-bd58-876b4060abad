@@ -1,0 +1,34 @@
+```csharp
+using System;
+
+public class Agent
+{
+    public string Generate(string input)
+    {
+        // Simulate API response for demonstration purposes
+        var response = new ApiResponse { Choices = new[] { new Choice { Message = new MessageContent { Content = null } } } };
+
+        if (response.Choices[0].Message.Content == null || string.IsNullOrEmpty(response.Choices[0].Message.Content))
+        {
+            return "No response from engine";
+        }
+
+        return response.Choices[0].Message.Content;
+    }
+}
+
+public class ApiResponse
+{
+    public Choice[] Choices { get; set; }
+}
+
+public class Choice
+{
+    public MessageContent Message { get; set; }
+}
+
+public class MessageContent
+{
+    public string Content { get; set; }
+}
+```

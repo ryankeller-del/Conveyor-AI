@@ -1,0 +1,4 @@
+- [2026-03-30T07:26:35.970007Z] Handoff mismatch detected for TestRefinerBot. Reassign narrower task scope with explicit file and failing behavior.
+- [2026-03-30T07:26:35.978183Z] Handoff mismatch detected for PerfBot. Reassign narrower task scope with explicit file and failing behavior.
+- [2026-03-30T07:30:38.267693Z] For task 'Build and harden a minimal task API in app_v3.py with input validation and clear', successful mitigation used: 1. Issue: 'pytest' is not recognized as an internal or external command, operable program or batch file.
+   - Likely Cause: The pytest executable is either not installed or not inc

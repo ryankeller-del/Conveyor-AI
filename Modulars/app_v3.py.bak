@@ -1,0 +1,100 @@
+python
+from flask import Flask, request, jsonify, abort
+
+app = Flask(__name__)
+
+tasks = []
+next_id = 1
+
+@app.errorhandler(400)
+def handle_bad_request(e):
+    return jsonify(error=str(e)), 400
+
+@app.errorhandler(404)
+def handle_not_found(e):
+    return jsonify(error="Resource not found"), 404
+
+@app.route('/tasks', methods=['GET'])
+def get_tasks():
+    return jsonify({"tasks": tasks})
+
+@app.route('/tasks', methods=['POST'])
+def create_task():
+    global next_id
+    data = request.get_json()
+    
+    if data is None:
+        abort(400, description="Invalid payload format")
+    if not isinstance(data, dict):
+        abort(400, description="Invalid payload format")
+    
+    errors = []
+    if 'title' not in data:
+        errors.append("Missing 'title' in payload")
+    elif not isinstance(data['title'], str):
+        errors.append("'title' must be a string")
+    
+    if 'description' in data and not isinstance(data['description'], str):
+        errors.append("Description must be a string")
+    
+    if 'completed' in data and not isinstance(data['completed'], bool):
+        errors.append("completed must be a boolean")
+    
+    if errors:
+        abort(400, description="; ".join(errors))
+    
+    task = {
+        'id': next_id,
+        'title': data['title'],
+        'description': data.get('description', ''),
+        'completed': data.get('completed', False)
+    }
+    tasks.append(task)
+    next_id += 1
+    return jsonify(task), 201
+
+@app.route('/tasks/<int:task_id>', methods=['PUT'])
+def update_task(task_id):
+    data = request.get_json()
+    
+    if data is None:
+        abort(400, description="Invalid payload format")
+    if not isinstance(data, dict):
+        abort(400, description="Invalid payload format")
+    
+    task = next((t for t in tasks if t['id'] == task_id), None)
+    if not task:
+        abort(404)
+    
+    allowed_fields = {'title', 'description', 'completed'}
+    errors = []
+    
+    for key in data:
+        if key not in allowed_fields:
+            errors.append(f"Invalid field '{key}'")
+    
+    if 'title' in data and not isinstance(data['title'], str):
+        errors.append("Title must be a string")
+    
+    if 'description' in data and not isinstance(data['description'], str):
+        errors.append("Description must be a string")
+    
+    if 'completed' in data and not isinstance(data['completed'], bool):
+        errors.append("completed must be a boolean")
+    
+    if errors:
+        abort(400, description="; ".join(errors))
+    
+    for key in allowed_fields & data.keys():
+        task[key] = data[key]
+    
+    return jsonify(task), 200
+
+@app.route('/tasks/<int:task_id>', methods=['DELETE'])
+def delete_task(task_id):
+    global tasks
+    initial_length = len(tasks)
+    tasks = [t for t in tasks if t['id'] != task_id]
+    if len(tasks) == initial_length:
+        abort(404, description="Task not found")
+    return jsonify({"status": "success"}), 200

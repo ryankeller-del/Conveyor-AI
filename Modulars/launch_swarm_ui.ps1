@@ -46,8 +46,30 @@ function Wait-ForHttp {
     return $false
 }
 
+function Open-SwarmTabs {
+    param(
+        [string]$ChainlitUrl,
+        [string]$FlaskHomeUrl,
+        [string]$FlaskSwarmUrl,
+        [string]$FlaskStatusUrl,
+        [string]$FlaskRunUrl
+    )
+
+    function Open-Url {
+        param([string]$Url)
+        Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "start", '""', $Url | Out-Null
+    }
+
+    Open-Url $ChainlitUrl
+    Open-Url $FlaskHomeUrl
+    Open-Url $FlaskSwarmUrl
+    Open-Url $FlaskStatusUrl
+    Open-Url $FlaskRunUrl
+}
+
 $chainlitUrl = "http://localhost:$ChainlitPort"
 $flaskHomeUrl = "http://localhost:$FlaskPort"
+$flaskSwarmUrl = "http://localhost:$FlaskPort/swarm"
 $flaskStatusUrl = "http://localhost:$FlaskPort/status"
 $flaskRunUrl = "http://localhost:$FlaskPort/run/examples"
 
@@ -64,7 +86,27 @@ Start-Process powershell -ArgumentList @(
 Start-Process powershell -ArgumentList @(
     "-NoExit",
     "-Command",
-    "Set-Location '$root'; `$env:PORT='$FlaskPort'; python app_v3.py *> '$flaskLog'"
+    "Set-Location '$root'; " +
+    "`$env:PORT='$FlaskPort'; " +
+    "`$env:FLASK_DEBUG='0'; " +
+    "`$flaskHomeUrl = '$flaskHomeUrl'; " +
+    "`$flaskSwarmUrl = '$flaskSwarmUrl'; " +
+    "`$flaskStatusUrl = '$flaskStatusUrl'; " +
+    "`$flaskRunUrl = '$flaskRunUrl'; " +
+    "while (`$true) { " +
+    "  python app_v3.py *>> '$flaskLog'; " +
+    "  `$exit = `$LASTEXITCODE; " +
+    "  if (`$exit -eq 0) { break }; " +
+    "  Start-Sleep -Seconds 2; " +
+    "  `$ready = `$false; " +
+    "  while (-not `$ready) { " +
+    "    try { `$null = Invoke-WebRequest -Uri `$flaskHomeUrl -UseBasicParsing -TimeoutSec 2; `$ready = `$true } " +
+    "    catch { Start-Sleep -Seconds 1 } " +
+    "  }; " +
+    "  Start-Process `$flaskSwarmUrl; " +
+    "  Start-Process `$flaskStatusUrl; " +
+    "  Start-Process `$flaskRunUrl; " +
+    "}"
 )
 
 if (-not (Wait-ForHttp -Url $chainlitUrl -TimeoutSeconds 90)) {
@@ -75,14 +117,12 @@ if (-not (Wait-ForHttp -Url $flaskHomeUrl -TimeoutSeconds 90)) {
     Write-Host "Flask did not become ready at $flaskHomeUrl"
 }
 
-Start-Process $chainlitUrl
-Start-Process $flaskHomeUrl
-Start-Process $flaskStatusUrl
-Start-Process $flaskRunUrl
+Open-SwarmTabs -ChainlitUrl $chainlitUrl -FlaskHomeUrl $flaskHomeUrl -FlaskSwarmUrl $flaskSwarmUrl -FlaskStatusUrl $flaskStatusUrl -FlaskRunUrl $flaskRunUrl
 
 Write-Host "Launched:"
 Write-Host " - Chainlit: $chainlitUrl"
 Write-Host " - Flask home: $flaskHomeUrl"
+Write-Host " - Flask swarm monitor: $flaskSwarmUrl"
 Write-Host " - Flask status: $flaskStatusUrl"
 Write-Host " - Flask examples: $flaskRunUrl"
 Write-Host "Logs:"

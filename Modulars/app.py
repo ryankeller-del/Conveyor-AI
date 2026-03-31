@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import socket
+import re
 from typing import Any, Dict
 
 import chainlit as cl
@@ -12,6 +13,7 @@ from bot_profiles_v3 import build_swarm_profiles
 from swarm_core.chat_lane import RollingConversation, detect_chat_mode, should_launch_swarm
 from swarm_core.bots import SimpleAgent
 from swarm_core.controller import SwarmController
+from swarm_core.local_models import desktop_ollama_base_url, desktop_ollama_target
 from swarm_core.types import RunConfig, TaskGoal
 
 load_dotenv()
@@ -21,9 +23,12 @@ def _client(base_url: str, api_key: str) -> OpenAI:
     return OpenAI(base_url=base_url, api_key=api_key)
 
 
-def _is_local_llm_available(host: str = "127.0.0.1", port: int = 11434, timeout: float = 0.5) -> bool:
+def _is_local_llm_available(host: str | None = None, port: int | None = None, timeout: float = 0.5) -> bool:
+    resolved_host, resolved_port = host, port
+    if resolved_host is None or resolved_port is None:
+        resolved_host, resolved_port = desktop_ollama_target()
     try:
-        with socket.create_connection((host, port), timeout=timeout):
+        with socket.create_connection((resolved_host, resolved_port), timeout=timeout):
             return True
     except OSError:
         return False
@@ -34,7 +39,7 @@ def _build_controller() -> SwarmController:
 
     groq_client = _client("https://api.groq.com/openai/v1", os.getenv("GROQ_API_KEY", ""))
     openrouter_client = _client("https://openrouter.ai/api/v1", os.getenv("OPENROUTER_API_KEY", ""))
-    local_client = _client("http://localhost:11434/v1", "ollama")
+    local_client = _client(desktop_ollama_base_url(), "ollama")
     local_available = _is_local_llm_available()
 
     test_agent = SimpleAgent(
@@ -167,6 +172,38 @@ def _parse_goal(message_text: str) -> TaskGoal:
     return TaskGoal(prompt=message_text, target_files=["app_v3.py"], language="general")
 
 
+def _parse_filesystem_request(message_text: str) -> Dict[str, Any] | None:
+    text = (message_text or "").strip()
+    lowered = text.lower()
+    if "folder" not in lowered and "directory" not in lowered and "file" not in lowered:
+        return None
+
+    folder_match = re.search(r"(?:called|named)\s+([A-Za-z0-9_\-]+)", text, re.IGNORECASE)
+    folder_name = folder_match.group(1) if folder_match else ""
+    if not folder_name:
+        return None
+
+    scope = "repo_root" if "above modulars" in lowered or "parent of modulars" in lowered else "project_root"
+    if "javascript" in lowered or lowered.endswith(".js"):
+        file_name = "hello.js"
+        content = 'const helloWorld = "Hello, world!";\nconsole.log(helloWorld);\n'
+    elif "typescript" in lowered or lowered.endswith(".ts"):
+        file_name = "hello.ts"
+        content = 'const helloWorld: string = "Hello, world!";\nconsole.log(helloWorld);\n'
+    else:
+        file_name = "hello.txt"
+        content = "Hello, world!\n"
+
+    if "hello world" not in lowered and "hello-world" not in lowered:
+        content = content.replace("Hello, world!", "Ready to help.")
+
+    return {
+        "folder_name": folder_name,
+        "scope": scope,
+        "files": [{"name": file_name, "content": content}],
+    }
+
+
 def _parse_config(payload: Dict[str, Any] | None = None) -> RunConfig:
     payload = payload or {}
     defaults = RunConfig()
@@ -206,6 +243,7 @@ def _control_actions():
         cl.Action(name="swarm_resume", label="Resume", payload={}),
         cl.Action(name="swarm_stop", label="Stop", payload={}),
         cl.Action(name="swarm_status", label="Status", payload={}),
+        cl.Action(name="chat_recap", label="Recap", payload={}),
         cl.Action(name="runner_pytest", label="Runner: Pytest", payload={}),
         cl.Action(name="runner_dotnet", label="Runner: Dotnet", payload={}),
         cl.Action(name="runner_npm", label="Runner: NPM Test", payload={}),
@@ -259,14 +297,28 @@ async def _send_status(controller: SwarmController, prefix: str = "Swarm status"
     local_memory_packet_count = status.get("local_memory_packet_count", 0)
     local_memory_reuse_count = status.get("local_memory_reuse_count", 0)
     local_memory_invalidations = status.get("local_memory_invalidations", 0)
+    local_memory_pressure = status.get("local_memory_pressure", 0.0)
+    local_memory_compaction_triggered = status.get("local_memory_compaction_triggered", False)
+    latest_local_memory_pressure = status.get("latest_local_memory_pressure", 0.0)
+    latest_local_memory_compaction_reason = status.get("latest_local_memory_compaction_reason") or "n/a"
     local_api_inflight = status.get("local_api_inflight", 0)
     local_api_throttle_hits = status.get("local_api_throttle_hits", 0)
     local_api_user_waiting = status.get("local_api_user_waiting", 0)
     local_api_swarm_waiting = status.get("local_api_swarm_waiting", 0)
     local_api_last_lane = status.get("local_api_last_lane") or "n/a"
+    local_model_host = status.get("local_model_host") or "n/a"
+    local_model_routes = status.get("local_model_routes") or {}
+    latest_local_model_name = status.get("latest_local_model_name") or "n/a"
+    latest_local_model_lane = status.get("latest_local_model_lane") or "n/a"
     latest_local_memory_note = status.get("latest_local_memory_note") or "n/a"
     latest_local_memory_agent = status.get("latest_local_memory_agent") or "n/a"
     latest_local_memory_task_family = status.get("latest_local_memory_task_family") or "n/a"
+    generation_memory_records = status.get("generation_memory_records", 0)
+    generation_memory_restores = status.get("generation_memory_restores", 0)
+    generation_memory_latest_generation_id = status.get("generation_memory_latest_generation_id") or "n/a"
+    generation_memory_latest_aspiration = status.get("generation_memory_latest_aspiration") or "n/a"
+    generation_memory_latest_note = status.get("generation_memory_latest_note") or "n/a"
+    generation_memory_path = status.get("generation_memory_path") or "n/a"
     returned_failure_streak = status.get("returned_failure_streak", 0)
     standard_test_fallback_count = status.get("standard_test_fallback_count", 0)
     latest_standard_test_reason = status.get("latest_standard_test_reason") or "n/a"
@@ -275,6 +327,15 @@ async def _send_status(controller: SwarmController, prefix: str = "Swarm status"
     chat_turn_count = status.get("chat_turn_count", 0)
     queued_architect_instruction_count = status.get("queued_architect_instruction_count", 0)
     latest_architect_instruction = status.get("latest_architect_instruction") or "n/a"
+    background_run_queue_depth = status.get("background_run_queue_depth", 0)
+    background_run_active_goal = status.get("background_run_active_goal") or "n/a"
+    background_run_last_run_id = status.get("background_run_last_run_id") or "n/a"
+    background_run_last_status = status.get("background_run_last_status") or "n/a"
+    filesystem_queue_depth = status.get("filesystem_queue_depth", 0)
+    filesystem_active_target = status.get("filesystem_active_target") or "n/a"
+    filesystem_last_path = status.get("filesystem_last_path") or "n/a"
+    filesystem_last_status = status.get("filesystem_last_status") or "n/a"
+    filesystem_last_result = status.get("filesystem_last_result") or "n/a"
     specialist_profiles = status.get("specialist_profiles") or []
     suggestions_text = "\n".join([f"- {item}" for item in suggestions]) if suggestions else "- none"
     warnings_text = "\n".join([f"- {item}" for item in warnings]) if warnings else "- none"
@@ -303,6 +364,15 @@ async def _send_status(controller: SwarmController, prefix: str = "Swarm status"
         specialist_text = "\n".join(profile_lines)
     else:
         specialist_text = "- none"
+    route_lines = []
+    for role, route in sorted(local_model_routes.items()):
+        primary = route.get("primary") or "n/a"
+        fallback = route.get("fallback") or []
+        route_lines.append(
+            f"- {role}: {primary}"
+            + (f" -> {', '.join(fallback)}" if fallback else "")
+        )
+    local_routes_text = "\n".join(route_lines) if route_lines else "- none"
     content = "\n".join(
         [
             f"{prefix}",
@@ -310,6 +380,15 @@ async def _send_status(controller: SwarmController, prefix: str = "Swarm status"
             "[Chat Lane]",
             f"Mode: {chat_mode}",
             f"Turns: {chat_turn_count}",
+            f"Background Queue Depth: {background_run_queue_depth}",
+            f"Background Active Goal: {background_run_active_goal}",
+            f"Background Last Run: {background_run_last_run_id}",
+            f"Background Last Status: {background_run_last_status}",
+            f"Filesystem Queue Depth: {filesystem_queue_depth}",
+            f"Filesystem Active Target: {filesystem_active_target}",
+            f"Filesystem Last Path: {filesystem_last_path}",
+            f"Filesystem Last Status: {filesystem_last_status}",
+            f"Filesystem Last Result: {filesystem_last_result}",
             f"Latest Architect Instruction: {latest_architect_instruction}",
             "",
             "[Swarm Health]",
@@ -331,14 +410,28 @@ async def _send_status(controller: SwarmController, prefix: str = "Swarm status"
             f"Local Memory Packets: {local_memory_packet_count}",
             f"Local Memory Reuses: {local_memory_reuse_count}",
             f"Local Memory Invalidations: {local_memory_invalidations}",
+            f"Local Memory Pressure: {local_memory_pressure:.2f}",
+            f"Latest Memory Pressure: {latest_local_memory_pressure:.2f}",
+            f"Memory Compaction Triggered: {local_memory_compaction_triggered}",
+            f"Latest Compaction Reason: {latest_local_memory_compaction_reason}",
             f"Local API Inflight: {local_api_inflight}",
             f"Local API Throttle Hits: {local_api_throttle_hits}",
             f"Local API User Waiting: {local_api_user_waiting}",
             f"Local API Swarm Waiting: {local_api_swarm_waiting}",
             f"Local API Last Lane: {local_api_last_lane}",
+            f"Local Model Host: {local_model_host}",
+            f"Latest Local Model: {latest_local_model_name}",
+            f"Latest Local Model Lane: {latest_local_model_lane}",
+            f"Local Model Routes:\n{local_routes_text}",
             f"Latest Local Memory Agent: {latest_local_memory_agent}",
             f"Latest Local Memory Family: {latest_local_memory_task_family}",
             f"Latest Local Memory Note: {latest_local_memory_note}",
+            f"Generation Memory Records: {generation_memory_records}",
+            f"Generation Memory Restores: {generation_memory_restores}",
+            f"Generation Memory Current ID: {generation_memory_latest_generation_id}",
+            f"Generation Memory Latest Aspiration: {generation_memory_latest_aspiration}",
+            f"Generation Memory Latest Note: {generation_memory_latest_note}",
+            f"Generation Memory Path: {generation_memory_path}",
             f"Queued Architect Briefs: {queued_architect_instruction_count}",
             f"Returned Failure Streak: {returned_failure_streak}",
             f"Standard Test Fallbacks: {standard_test_fallback_count}",
@@ -415,8 +508,9 @@ async def on_chat_start():
     await cl.Message(
         content=(
             "Autonomous Swarm v2 online.\n"
-            "Normal messages chat with the local bot first; use /swarm <goal> or /runjson <json> to start the swarm.\n"
-            "Ask for /health to get a swarm health summary, or /architect to queue a master-architect brief.\n"
+            "Normal messages chat with the local bot first; background swarm work queues after the reply.\n"
+            "Use /swarm <goal> or /runjson <json> to queue a staged background run.\n"
+            "Ask for /health to get a swarm health summary, /recap to summarize the recent chat, or /architect to queue a master-architect brief.\n"
             "Preflight suggestions, requested tools, and requested updates are prepared internally.\n"
             "Rehearsal simulations can run in parallel and hot-swap better stage manifests.\n"
             "Commands: /pause, /resume, /stop, /status, /testcmd <command>, "
@@ -452,6 +546,13 @@ async def on_stop(_: cl.Action):
 async def on_status(_: cl.Action):
     controller: SwarmController = cl.user_session.get("swarm_controller")
     await _send_status(controller)
+
+
+@cl.action_callback("chat_recap")
+async def on_chat_recap(_: cl.Action):
+    controller: SwarmController = cl.user_session.get("swarm_controller")
+    recap_prompt = "show me the chats that have happened so far"
+    await _handle_local_chat(controller, cl.Message(content=recap_prompt), recap_prompt, "recap")
 
 
 async def _set_runner(command: str, label: str):
@@ -592,7 +693,8 @@ async def _handle_local_chat(
 ):
     transcript = _chat_transcript()
     transcript.append("user", text, user_message)
-    conversation_context = transcript.recent_context(limit=8)
+    context_limit = 12 if mode == "recap" else 8
+    conversation_context = transcript.recent_context(limit=context_limit)
     config = _parse_config()
     result = await asyncio.to_thread(
         controller.respond_to_chat,
@@ -616,7 +718,26 @@ async def _handle_local_chat(
         actions=_control_actions(),
     ).send()
     transcript.append("assistant", reply, assistant_message)
+    if background_instruction:
+        controller.queue_architect_instruction(background_instruction, source="chat")
     await transcript.trim()
+
+
+async def _queue_background_swarm(
+    controller: SwarmController,
+    goal: TaskGoal,
+    config: RunConfig,
+    label: str,
+):
+    queue_id = controller.queue_background_run(goal, config=config, source=label)
+    await cl.Message(
+        content=(
+            f"{label.capitalize()} queued: {queue_id}\n"
+            "The local chat lane stays open while the background swarm works."
+        ),
+        actions=_control_actions(),
+    ).send()
+    await _send_status(controller, f"{label.capitalize()} queued")
 
 
 @cl.action_callback("adaptive_on")
@@ -736,6 +857,9 @@ async def on_message(message: cl.Message):
             return
         await _run_rehearsal(profile)
         return
+    if text.lower() == "/recap":
+        await _handle_local_chat(controller, message, "show me the chats that have happened so far", "recap")
+        return
 
     if text.lower().startswith("/runjson "):
         raw_json = text[len("/runjson "):].strip()
@@ -754,15 +878,7 @@ async def on_message(message: cl.Message):
             "test_command",
             cl.user_session.get("active_test_command") or config.test_command,
         )
-        run_id = controller.start(goal=goal, config=config)
-        await cl.Message(
-            content=(
-                f"Run started: {run_id}\n"
-                "Preflight prep ran internally and the request list is visible in /status."
-            ),
-            actions=_control_actions(),
-        ).send()
-        await _send_status(controller)
+        await _queue_background_swarm(controller, goal, config, "run")
         return
 
     if should_launch_swarm(text):
@@ -772,22 +888,14 @@ async def on_message(message: cl.Message):
             return
         goal = _parse_goal(swarm_goal)
         config = _parse_config()
-        run_id = controller.start(goal=goal, config=config)
-        await cl.Message(
-            content=(
-                f"Swarm run started: {run_id}\n"
-                "The local chat lane stays open while the background swarm works."
-            ),
-            actions=_control_actions(),
-        ).send()
-        await _send_status(controller)
+        await _queue_background_swarm(controller, goal, config, "swarm")
         return
 
     if not text:
         await cl.Message(
             content=(
                 "Type a chat message, /health for a swarm summary, "
-                "/architect for a master-architect request, or /swarm <goal> to launch a run."
+                "/recap for a chat recap, /architect for a master-architect request, or /swarm <goal> to launch a run."
             )
         ).send()
         return
@@ -803,9 +911,30 @@ async def on_message(message: cl.Message):
         await cl.Message(
             content=(
                 "Unknown command. Use /swarm <goal> to start a swarm run, "
-                "/health for a health report, or /architect for a master-architect request."
+                "/health for a health report, /recap for a chat recap, or /architect for a master-architect request."
             )
         ).send()
+        return
+
+    filesystem_request = _parse_filesystem_request(text)
+    if filesystem_request:
+        await _handle_local_chat(controller, message, text, "chat")
+        queue_id = controller.queue_filesystem_creation(
+            folder_name=filesystem_request["folder_name"],
+            files=filesystem_request["files"],
+            scope=filesystem_request["scope"],
+            source="chat",
+            note=text,
+        )
+        await cl.Message(
+            content=(
+                f"File task queued: {queue_id}\n"
+                f"Creating {filesystem_request['folder_name']} and requested file(s) "
+                "in the background."
+            ),
+            actions=_control_actions(),
+        ).send()
+        await _send_status(controller, "File task queued")
         return
 
     await _handle_local_chat(controller, message, text, chat_mode)

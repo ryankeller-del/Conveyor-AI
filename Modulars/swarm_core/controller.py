@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
@@ -6,6 +6,7 @@ import re
 import threading
 import time
 import uuid
+from queue import Empty, Queue
 from dataclasses import asdict
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -16,10 +17,11 @@ from .compaction import DistillationLoop
 from .efficiency import EfficiencyAnalyzer
 from .failure_memory import FailureMemory
 from .hallucination_guard import HallucinationGuard
-from .local_runtime import AgentMemoryManager, LocalCallGovernor
+from .local_runtime import AgentMemoryManager, GenerationMemoryArchive, LocalCallGovernor
 from .prompt_guard import PromptGuard
 from .preflight import PrepBundle, SwarmPreflightManager
 from .rehearsal import OfflineRehearsalManager, score_stage_state, stage_manifest_from_snapshot
+from .local_models import build_desktop_local_routes, desktop_ollama_api_root
 from .rosetta import RosettaStone
 from .standard_tests import StandardTestLibrary
 from .skill_evolution import SkillEvolutionManager
@@ -77,8 +79,14 @@ class SwarmController:
             os.path.join(self.root_dir, "swarm_learning", "agent_memory"),
             max_packet_chars=1800,
         )
+        self.generation_memory = GenerationMemoryArchive(
+            os.path.join(self.root_dir, "swarm_learning", "generation_memory"),
+        )
+        self.agent_memory.attach_generation_archive(self.generation_memory)
         self.standard_tests = StandardTestLibrary()
         self.local_governor = LocalCallGovernor()
+        self.local_model_host = desktop_ollama_api_root()
+        self.local_model_routes = build_desktop_local_routes()
         self.hallucination_guard = HallucinationGuard(self.root_dir)
         self.distillation = DistillationLoop(
             pattern_agent=pattern_agent,
@@ -93,6 +101,25 @@ class SwarmController:
             stability_agent=stability_prep_agent,
         )
         self.rehearsal = OfflineRehearsalManager(self.root_dir)
+        for agent in [
+            self.test_bot.agent,
+            self.coder_agent,
+            self.judge_bot.agent,
+            self.chat_agent,
+            self.prompt_guard.guard_agent,
+            self.distillation.pattern_agent,
+            self.distillation.compression_agent,
+            self.distillation.novelty_agent,
+            self.stability_guard.agent,
+            self.preflight.seed_agent,
+            self.preflight.directive_agent,
+            self.preflight.stability_agent,
+        ]:
+            if agent is not None:
+                try:
+                    agent.message_sink = self._record_swarm_message
+                except Exception:
+                    pass
         self._lock = threading.RLock()
         self._rehearsal_lock = threading.RLock()
         self._pause_event = threading.Event()
@@ -121,6 +148,18 @@ class SwarmController:
         self.latest_local_memory_note = ""
         self.latest_local_memory_agent = ""
         self.latest_local_memory_task_family = ""
+        self.generation_memory_records = 0
+        self.generation_memory_restores = 0
+        self.generation_memory_latest_generation_id = ""
+        self.generation_memory_latest_aspiration = ""
+        self.generation_memory_latest_note = ""
+        self.generation_memory_path = ""
+        self.latest_local_memory_pressure = 0.0
+        self.latest_local_memory_compaction_reason = ""
+        self.local_memory_pressure = 0.0
+        self.local_memory_compaction_triggered = False
+        self.latest_local_model_name = ""
+        self.latest_local_model_lane = ""
         self.local_api_inflight = 0
         self.local_api_throttle_hits = 0
         self.returned_failure_streak = 0
@@ -132,6 +171,22 @@ class SwarmController:
         self.chat_turn_count = 0
         self.latest_architect_instruction = ""
         self.queued_architect_briefs: List[str] = []
+        self._swarm_feed: List[Dict[str, str]] = []
+        self._background_run_queue: "Queue[Dict[str, object]]" = Queue()
+        self._background_worker_started = False
+        self._background_worker_thread: Optional[threading.Thread] = None
+        self.background_run_queue_depth = 0
+        self.background_run_active_goal = ""
+        self.background_run_last_run_id = ""
+        self.background_run_last_status = ""
+        self._filesystem_queue: "Queue[Dict[str, object]]" = Queue()
+        self._filesystem_worker_started = False
+        self._filesystem_worker_thread: Optional[threading.Thread] = None
+        self.filesystem_queue_depth = 0
+        self.filesystem_active_target = ""
+        self.filesystem_last_path = ""
+        self.filesystem_last_status = ""
+        self.filesystem_last_result = ""
         self.recent_metrics: List[RunMetrics] = []
         self.unfinished_features: List[str] = []
         self.current_focus = ""
@@ -176,6 +231,12 @@ class SwarmController:
             self.active_run_config = RunConfig(**asdict(run_config))
             self.run_id = datetime.utcnow().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
             self.artifacts = ArtifactStore(run_config.artifacts_dir, self.run_id)
+            previous_generation = str(self.generation_memory.status().get("latest_generation_id", ""))
+            self.generation_memory.begin_generation(
+                generation_id=self.run_id,
+                aspiration_prompt=goal.prompt,
+                source_generation_id=previous_generation,
+            )
             queued_briefs = list(self.queued_architect_briefs)
             self.queued_architect_briefs = []
             self.snapshot = RunSnapshot(
@@ -225,6 +286,12 @@ class SwarmController:
             self.latest_local_memory_note = ""
             self.latest_local_memory_agent = ""
             self.latest_local_memory_task_family = ""
+            self.latest_local_memory_pressure = 0.0
+            self.latest_local_memory_compaction_reason = ""
+            self.local_memory_pressure = 0.0
+            self.local_memory_compaction_triggered = False
+            self.latest_local_model_name = ""
+            self.latest_local_model_lane = ""
             self.local_api_inflight = 0
             self.local_api_throttle_hits = 0
             self.returned_failure_streak = 0
@@ -232,15 +299,27 @@ class SwarmController:
             self.latest_standard_test_reason = ""
             self.latest_standard_test_pack = ""
             self.latest_specialist_profiles = []
+            self.generation_memory_records = 0
+            self.generation_memory_restores = 0
+            self.generation_memory_latest_generation_id = ""
+            self.generation_memory_latest_aspiration = ""
+            self.generation_memory_latest_note = ""
+            self.generation_memory_path = ""
             self.latest_rehearsal = None
             self.rehearsal_state = "IDLE"
             self.rehearsal_profile = ""
             self.rehearsal_report_path = ""
             self.rehearsal_manifest_path = ""
             self.rehearsal_trace_path = ""
+            self._save_state()
             self._pause_event.set()
             self.artifacts.append_progress("Run started")
-            self.artifacts.append_event("run_started", {"goal": asdict(goal), "config": asdict(run_config)})
+        self.artifacts.append_event("run_started", {"goal": asdict(goal), "config": asdict(run_config)})
+        self._record_swarm_feed(
+            "run",
+            "Run started",
+            f"Goal: {goal.prompt[:240]} | Target files: {', '.join(goal.target_files)}",
+        )
 
         worker = threading.Thread(
             target=self._run_loop,
@@ -350,6 +429,344 @@ class SwarmController:
 
         return self.start(goal, config)
 
+    def queue_filesystem_creation(
+        self,
+        folder_name: str,
+        files: List[Dict[str, str]],
+        scope: str = "repo_root",
+        source: str = "chat",
+        note: str = "",
+    ) -> str:
+        clean_folder = (folder_name or "").strip()
+        if not clean_folder:
+            raise ValueError("folder_name is required")
+        payload = {
+            "folder_name": clean_folder[:120],
+            "files": [
+                {
+                    "name": str(item.get("name", "")).strip() or "hello.js",
+                    "content": str(item.get("content", "")),
+                }
+                for item in (files or [])
+            ],
+            "scope": (scope or "repo_root").strip().lower(),
+            "source": source,
+            "note": note[:220],
+            "queued_at": time.time(),
+            "request_id": uuid.uuid4().hex[:12],
+        }
+        if not payload["files"]:
+            payload["files"] = [{"name": "hello.js", "content": 'const helloWorld = "Hello, world!";\n'}]
+
+        with self._lock:
+            self._filesystem_queue.put(payload)
+            self._ensure_filesystem_worker_locked()
+            self.filesystem_queue_depth = self._filesystem_queue.qsize()
+            self.filesystem_active_target = clean_folder[:180]
+            self.filesystem_last_status = f"queued from {source}"
+            self.snapshot.filesystem_queue_depth = self.filesystem_queue_depth
+            self.snapshot.filesystem_active_target = self.filesystem_active_target
+            self.snapshot.filesystem_last_path = self.filesystem_last_path
+            self.snapshot.filesystem_last_status = self.filesystem_last_status
+            self.snapshot.filesystem_last_result = self.filesystem_last_result
+            self._save_state()
+
+        if self.artifacts:
+            self.artifacts.append_event(
+                "filesystem_task_queued",
+                {
+                    "request_id": payload["request_id"],
+                    "source": source,
+                    "scope": payload["scope"],
+                    "folder_name": payload["folder_name"],
+                    "files": [item["name"] for item in payload["files"]],
+                    "queue_depth": self._filesystem_queue.qsize(),
+                    "note": note,
+                },
+            )
+            self.artifacts.append_progress(
+                f"Filesystem task queued from {source}: {clean_folder}"
+            )
+        self._record_swarm_feed(
+            "filesystem",
+            "Filesystem task queued",
+            f"{source}: create {clean_folder} ({payload['scope']}) with {len(payload['files'])} file(s).",
+        )
+        return str(payload["request_id"])
+
+    def queue_background_run(
+        self,
+        goal: TaskGoal,
+        config: Optional[RunConfig] = None,
+        source: str = "chat",
+    ) -> str:
+        payload = {
+            "goal": TaskGoal(
+                prompt=goal.prompt,
+                target_files=list(goal.target_files),
+                language=goal.language,
+            ),
+            "config": RunConfig(
+                **asdict(config or self.active_run_config or self.preflight_config or RunConfig())
+            ),
+            "source": source,
+            "queued_at": time.time(),
+            "request_id": uuid.uuid4().hex[:12],
+        }
+        with self._lock:
+            self._background_run_queue.put(payload)
+            self._ensure_background_worker_locked()
+            self.background_run_queue_depth = self._background_run_queue.qsize()
+            self.background_run_last_status = f"queued from {source}"
+            self.snapshot.background_run_queue_depth = self.background_run_queue_depth
+            self.snapshot.background_run_active_goal = self.background_run_active_goal
+            self.snapshot.background_run_last_run_id = self.background_run_last_run_id
+            self.snapshot.background_run_last_status = self.background_run_last_status
+            self._save_state()
+        if self.artifacts:
+            self.artifacts.append_event(
+                "background_run_queued",
+                {
+                    "request_id": payload["request_id"],
+                    "source": source,
+                    "goal": asdict(payload["goal"]),
+                    "queue_depth": self._background_run_queue.qsize(),
+                },
+            )
+            self.artifacts.append_progress(
+                f"Background run queued from {source}: {goal.prompt[:140]}"
+            )
+        self._record_swarm_feed(
+            "background",
+            "Background run queued",
+            f"{source}: {goal.prompt[:200]}",
+        )
+        return str(payload["request_id"])
+
+    def _ensure_background_worker_locked(self) -> None:
+        if self._background_worker_started:
+            return
+        self._background_worker_started = True
+        self._background_worker_thread = threading.Thread(
+            target=self._background_run_worker,
+            name="swarm-background-launcher",
+            daemon=True,
+        )
+        self._background_worker_thread.start()
+
+    def _ensure_filesystem_worker_locked(self) -> None:
+        if self._filesystem_worker_started:
+            return
+        self._filesystem_worker_started = True
+        self._filesystem_worker_thread = threading.Thread(
+            target=self._filesystem_worker,
+            name="swarm-filesystem-launcher",
+            daemon=True,
+        )
+        self._filesystem_worker_thread.start()
+
+    def _background_run_worker(self) -> None:
+        while True:
+            try:
+                item = self._background_run_queue.get(timeout=0.2)
+            except Empty:
+                with self._lock:
+                    self.background_run_queue_depth = self._background_run_queue.qsize()
+                    self.snapshot.background_run_queue_depth = self.background_run_queue_depth
+                    self._save_state()
+                continue
+
+            goal = item["goal"]
+            config = item["config"]
+            source = str(item.get("source", "chat"))
+            request_id = str(item.get("request_id", ""))
+
+            while True:
+                with self._lock:
+                    active_state = self.snapshot.state
+                if active_state not in {
+                    RunState.RUNNING,
+                    RunState.PREPARING,
+                    RunState.PAUSED,
+                    RunState.STOPPING,
+                }:
+                    break
+                time.sleep(0.2)
+
+            with self._lock:
+                self.background_run_active_goal = getattr(goal, "prompt", "")[:180]
+                self.background_run_last_status = f"launching from {source}"
+                self.background_run_queue_depth = self._background_run_queue.qsize()
+                self.snapshot.background_run_active_goal = self.background_run_active_goal
+                self.snapshot.background_run_last_run_id = self.background_run_last_run_id
+                self.snapshot.background_run_last_status = self.background_run_last_status
+                self.snapshot.background_run_queue_depth = self.background_run_queue_depth
+                self._save_state()
+
+            run_id = ""
+            try:
+                run_id = self.start(goal, config)
+            except Exception as exc:
+                with self._lock:
+                    self.background_run_active_goal = ""
+                    self.background_run_last_status = f"failed to launch: {exc}"
+                    self.background_run_queue_depth = self._background_run_queue.qsize()
+                    self.snapshot.background_run_active_goal = self.background_run_active_goal
+                    self.snapshot.background_run_last_run_id = self.background_run_last_run_id
+                    self.snapshot.background_run_last_status = self.background_run_last_status
+                    self.snapshot.background_run_queue_depth = self.background_run_queue_depth
+                    self._save_state()
+                if self.artifacts:
+                    self.artifacts.append_event(
+                        "background_run_failed",
+                        {
+                            "request_id": request_id,
+                            "source": source,
+                            "goal": asdict(goal),
+                            "error": str(exc),
+                        },
+                    )
+                continue
+
+            with self._lock:
+                self.background_run_last_run_id = run_id
+                self.background_run_last_status = f"started {run_id}"
+                self.background_run_queue_depth = self._background_run_queue.qsize()
+                self.snapshot.background_run_active_goal = self.background_run_active_goal
+                self.snapshot.background_run_last_run_id = self.background_run_last_run_id
+                self.snapshot.background_run_last_status = self.background_run_last_status
+                self.snapshot.background_run_queue_depth = self.background_run_queue_depth
+                self._save_state()
+            if self.artifacts:
+                self.artifacts.append_event(
+                    "background_run_started",
+                    {
+                        "request_id": request_id,
+                        "source": source,
+                        "goal": asdict(goal),
+                        "run_id": run_id,
+                    },
+                )
+
+            while True:
+                with self._lock:
+                    active_state = self.snapshot.state
+                    current_state = self.snapshot.state.value
+                if active_state not in {
+                    RunState.RUNNING,
+                    RunState.PREPARING,
+                    RunState.PAUSED,
+                    RunState.STOPPING,
+                }:
+                    break
+                time.sleep(0.25)
+
+            with self._lock:
+                self.background_run_active_goal = ""
+                self.background_run_last_status = f"completed with {current_state}"
+                self.background_run_queue_depth = self._background_run_queue.qsize()
+                self.snapshot.background_run_active_goal = self.background_run_active_goal
+                self.snapshot.background_run_last_run_id = self.background_run_last_run_id
+                self.snapshot.background_run_last_status = self.background_run_last_status
+                self.snapshot.background_run_queue_depth = self.background_run_queue_depth
+                self._save_state()
+            if self.artifacts:
+                self.artifacts.append_event(
+                    "background_run_completed",
+                    {
+                        "request_id": request_id,
+                        "source": source,
+                        "goal": asdict(goal),
+                        "run_id": run_id,
+                        "state": current_state,
+                    },
+                )
+
+    def _filesystem_worker(self) -> None:
+        while True:
+            try:
+                item = self._filesystem_queue.get(timeout=0.2)
+            except Empty:
+                with self._lock:
+                    self.filesystem_queue_depth = self._filesystem_queue.qsize()
+                    self.snapshot.filesystem_queue_depth = self.filesystem_queue_depth
+                    self._save_state()
+                continue
+
+            folder_name = str(item.get("folder_name", "")).strip()
+            files = list(item.get("files", []))
+            scope = str(item.get("scope", "repo_root")).strip().lower()
+            source = str(item.get("source", "chat"))
+            request_id = str(item.get("request_id", ""))
+            base_dir = self._filesystem_scope_base_dir(scope)
+            folder_path = os.path.join(base_dir, folder_name)
+            created_paths: List[str] = []
+            result = "created"
+
+            with self._lock:
+                self.filesystem_active_target = folder_name[:180]
+                self.filesystem_last_status = f"running from {source}"
+                self.snapshot.filesystem_active_target = self.filesystem_active_target
+                self.snapshot.filesystem_last_status = self.filesystem_last_status
+                self.snapshot.filesystem_queue_depth = self._filesystem_queue.qsize()
+                self._save_state()
+
+            try:
+                os.makedirs(folder_path, exist_ok=True)
+                for file_item in files:
+                    file_name = str(file_item.get("name", "")).strip() or "hello.js"
+                    content = str(file_item.get("content", ""))
+                    target_path = os.path.join(folder_path, file_name)
+                    self._write_file(target_path, content)
+                    created_paths.append(target_path)
+                if not created_paths:
+                    created_paths.append(folder_path)
+                result = "created folder and files"
+            except Exception as exc:
+                result = f"failed: {exc}"
+                if self.artifacts:
+                    self.artifacts.append_event(
+                        "filesystem_task_failed",
+                        {
+                            "request_id": request_id,
+                            "source": source,
+                            "folder_name": folder_name,
+                            "scope": scope,
+                            "error": str(exc),
+                        },
+                    )
+            finally:
+                with self._lock:
+                    self.filesystem_queue_depth = self._filesystem_queue.qsize()
+                    self.filesystem_active_target = ""
+                    self.filesystem_last_path = created_paths[-1] if created_paths else folder_path
+                    self.filesystem_last_status = result
+                    self.filesystem_last_result = ", ".join(created_paths) if created_paths else result
+                    self.snapshot.filesystem_queue_depth = self.filesystem_queue_depth
+                    self.snapshot.filesystem_active_target = self.filesystem_active_target
+                    self.snapshot.filesystem_last_path = self.filesystem_last_path
+                    self.snapshot.filesystem_last_status = self.filesystem_last_status
+                    self.snapshot.filesystem_last_result = self.filesystem_last_result
+                    self._save_state()
+                if self.artifacts:
+                    self.artifacts.append_event(
+                        "filesystem_task_completed",
+                        {
+                            "request_id": request_id,
+                            "source": source,
+                            "folder_name": folder_name,
+                            "scope": scope,
+                            "paths": created_paths,
+                            "result": result,
+                        },
+                    )
+
+    def _filesystem_scope_base_dir(self, scope: str) -> str:
+        normalized = (scope or "repo_root").strip().lower()
+        if normalized in {"repo_root", "above_modulars", "parent", "workspace_root"}:
+            return os.path.abspath(os.path.join(self.root_dir, os.pardir))
+        return self.root_dir
+
     def status(self) -> Dict:
         with self._lock:
             payload = asdict(self.snapshot)
@@ -445,6 +862,25 @@ class SwarmController:
             payload["latest_local_memory_task_family"] = memory_status.get(
                 "latest_task_family", ""
             )
+            payload["latest_local_memory_pressure"] = memory_status.get("latest_pressure", 0.0)
+            payload["latest_local_memory_compaction_reason"] = memory_status.get(
+                "latest_compaction_reason", ""
+            )
+            payload["local_memory_pressure"] = memory_status.get("latest_pressure", 0.0)
+            payload["local_memory_compaction_triggered"] = memory_status.get(
+                "compaction_triggered", False
+            )
+            generation_status = self.generation_memory.status()
+            payload["generation_memory_records"] = generation_status.get("record_count", 0)
+            payload["generation_memory_restores"] = generation_status.get("restore_count", 0)
+            payload["generation_memory_latest_generation_id"] = generation_status.get(
+                "latest_generation_id", ""
+            )
+            payload["generation_memory_latest_aspiration"] = generation_status.get(
+                "latest_aspiration", ""
+            )
+            payload["generation_memory_latest_note"] = generation_status.get("latest_note", "")
+            payload["generation_memory_path"] = generation_status.get("base_dir", "")
             profile_limit = (self.active_run_config or self.preflight_config or RunConfig()).specialist_profile_limit
             payload["specialist_profiles"] = self.agent_memory.specialist_profiles(limit=profile_limit)
             payload["returned_failure_streak"] = self.returned_failure_streak
@@ -457,11 +893,226 @@ class SwarmController:
             payload["local_api_user_waiting"] = governor_status.get("user_waiting", 0)
             payload["local_api_swarm_waiting"] = governor_status.get("swarm_waiting", 0)
             payload["local_api_last_lane"] = governor_status.get("last_lane", "swarm")
+            payload["local_model_host"] = self.local_model_host
+            payload["local_model_routes"] = self.local_model_routes
+            payload["latest_local_model_name"] = self.latest_local_model_name
+            payload["latest_local_model_lane"] = self.latest_local_model_lane
             payload["chat_mode"] = self.chat_mode
             payload["chat_turn_count"] = self.chat_turn_count
             payload["queued_architect_instruction_count"] = len(self.queued_architect_briefs)
             payload["latest_architect_instruction"] = self.latest_architect_instruction
+            payload["background_run_queue_depth"] = self._background_run_queue.qsize()
+            payload["background_run_active_goal"] = self.background_run_active_goal
+            payload["background_run_last_run_id"] = self.background_run_last_run_id
+            payload["background_run_last_status"] = self.background_run_last_status
+            payload["filesystem_queue_depth"] = self._filesystem_queue.qsize()
+            payload["filesystem_active_target"] = self.filesystem_active_target
+            payload["filesystem_last_path"] = self.filesystem_last_path
+            payload["filesystem_last_status"] = self.filesystem_last_status
+            payload["filesystem_last_result"] = self.filesystem_last_result
             return payload
+
+    def recent_swarm_narrative(self, limit: int = 80) -> List[Dict[str, str]]:
+        entries: List[Dict[str, str]] = []
+        with self._lock:
+            feed_entries = list(self._swarm_feed[-limit:])
+        for item in feed_entries:
+            entries.append(
+                {
+                    "timestamp": item.get("timestamp", ""),
+                    "kind": item.get("kind", "event"),
+                    "headline": item.get("headline", "event"),
+                    "text": item.get("text", ""),
+                }
+            )
+        if not self.artifacts:
+            return entries[-limit:]
+
+        if os.path.exists(self.artifacts.events_path):
+            try:
+                with open(self.artifacts.events_path, "r", encoding="utf-8") as handle:
+                    rows = [line.strip() for line in handle if line.strip()]
+                for line in rows[-limit:]:
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    event_type = str(row.get("event_type", "event"))
+                    payload = row.get("payload") or {}
+                    timestamp = str(row.get("timestamp", ""))
+                    text = self._format_swarm_event(event_type, payload)
+                    if text:
+                        entries.append(
+                            {
+                                "timestamp": timestamp,
+                                "kind": "event",
+                                "headline": event_type,
+                                "text": text,
+                            }
+                        )
+            except Exception:
+                pass
+
+        if os.path.exists(self.artifacts.progress_path):
+            try:
+                with open(self.artifacts.progress_path, "r", encoding="utf-8") as handle:
+                    rows = [line.rstrip("\n") for line in handle if line.strip()]
+                for line in rows[-limit:]:
+                    timestamp = ""
+                    text = line
+                    match = re.match(r"^-\s+\[(.*?)\]\s+(.*)$", line)
+                    if match:
+                        timestamp = match.group(1)
+                        text = match.group(2)
+                    entries.append(
+                        {
+                            "timestamp": timestamp,
+                            "kind": "progress",
+                            "headline": "progress",
+                            "text": text,
+                        }
+                    )
+            except Exception:
+                pass
+
+        entries = [entry for entry in entries if entry.get("text")]
+        entries.sort(key=lambda item: item.get("timestamp", ""))
+        return entries[-limit:]
+
+    def _record_swarm_feed(self, kind: str, headline: str, text: str) -> None:
+        entry = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "kind": kind,
+            "headline": headline[:120],
+            "text": text[:1000],
+        }
+        with self._lock:
+            self._swarm_feed.append(entry)
+            self._swarm_feed = self._swarm_feed[-200:]
+
+    def _record_swarm_message(
+        self,
+        agent_name: str,
+        model: str,
+        lane: str,
+        prompt: str,
+        content: str,
+    ) -> None:
+        prompt_preview = (prompt or "").strip().replace("\n", " ")
+        prompt_preview = re.sub(r"\s+", " ", prompt_preview)[:180]
+        content_text = (content or "").strip()
+        if not content_text:
+            return
+        headline = f"{agent_name} via {model} ({lane})"
+        text = f"{prompt_preview}\n\n{content_text[:1200]}"
+        with self._lock:
+            self.latest_local_model_name = model[:160]
+            self.latest_local_model_lane = lane[:80]
+            self._save_state()
+        self._record_swarm_feed("agent_message", headline, text)
+        if self.artifacts:
+            self.artifacts.append_event(
+                "agent_message",
+                {
+                    "agent_name": agent_name,
+                    "model": model,
+                    "lane": lane,
+                    "prompt_excerpt": prompt_preview,
+                    "content_excerpt": content_text[:800],
+                },
+            )
+
+    def _format_swarm_event(self, event_type: str, payload: Dict[str, object]) -> str:
+        if event_type == "run_started":
+            goal = payload.get("goal") or {}
+            prompt = ""
+            if isinstance(goal, dict):
+                prompt = str(goal.get("prompt", ""))
+            return f"Run started: {prompt or 'new goal received'}"
+        if event_type == "run_complete":
+            status = payload.get("status", "")
+            return f"Run complete: {status}"
+        if event_type == "run_failed_quality_gate":
+            status = payload.get("status", "")
+            return f"Run failed quality gate: {status}"
+        if event_type == "preflight_prepared":
+            bundle = payload.get("bundle_id", "")
+            return f"Preflight bundle prepared: {bundle}"
+        if event_type == "preflight_review":
+            decision = payload.get("decision", "")
+            target = payload.get("target", "")
+            return f"Preflight review {str(decision).upper()} for {target}"
+        if event_type == "background_run_queued":
+            source = payload.get("source", "")
+            goal = payload.get("goal") or {}
+            prompt = ""
+            if isinstance(goal, dict):
+                prompt = str(goal.get("prompt", ""))
+            return f"Background run queued from {source}: {prompt}"
+        if event_type == "background_run_started":
+            run_id = payload.get("run_id", "")
+            return f"Background run started: {run_id}"
+        if event_type == "background_run_completed":
+            state = payload.get("state", "")
+            run_id = payload.get("run_id", "")
+            return f"Background run completed ({state}): {run_id}"
+        if event_type == "background_run_failed":
+            error = payload.get("error", "")
+            return f"Background run failed: {error}"
+        if event_type == "filesystem_task_queued":
+            folder = payload.get("folder_name", "")
+            return f"Filesystem task queued for {folder}"
+        if event_type == "filesystem_task_completed":
+            folder = payload.get("folder_name", "")
+            result = payload.get("result", "")
+            return f"Filesystem task completed for {folder}: {result}"
+        if event_type == "filesystem_task_failed":
+            folder = payload.get("folder_name", "")
+            error = payload.get("error", "")
+            return f"Filesystem task failed for {folder}: {error}"
+        if event_type == "judge_result":
+            passed = payload.get("passed", False)
+            output = str(payload.get("output_excerpt", "")).strip()
+            outcome = "passed" if passed else "failed"
+            return f"Judge {outcome}: {output}"
+        if event_type == "tests_generated":
+            wave = payload.get("wave", "")
+            generated = payload.get("generated", 0)
+            approved = payload.get("approved", 0)
+            return f"Wave {wave}: generated {generated} tests, approved {approved}"
+        if event_type == "implementation_written":
+            target_file = payload.get("target_file", "")
+            return f"Implementation written to {target_file}"
+        if event_type == "hallucination_check":
+            confidence = payload.get("confidence", 0.0)
+            alerts = payload.get("alerts", 0)
+            return f"Hallucination check: confidence {confidence}, alerts {alerts}"
+        if event_type == "prompt_guard_event":
+            purpose = payload.get("purpose", "")
+            note = payload.get("note", "")
+            return f"Prompt guard {purpose}: {note}"
+        if event_type == "agent_spawned":
+            agent_name = payload.get("agent_name", "")
+            reason = payload.get("reason", "")
+            return f"Spawned {agent_name}: {reason}"
+        if event_type == "stage_manifest_applied":
+            manifest_id = payload.get("manifest_id", "")
+            score = payload.get("score", 0.0)
+            return f"Applied stage manifest {manifest_id} at score {score}"
+        if event_type == "stage_manifest_rejected":
+            manifest_id = payload.get("manifest_id", "")
+            return f"Rejected stage manifest {manifest_id}"
+        if event_type == "rehearsal_completed":
+            rehearsal_id = payload.get("rehearsal_id", "")
+            accepted = payload.get("accepted", False)
+            return f"Rehearsal {rehearsal_id} completed, accepted={accepted}"
+        if event_type == "architect_instruction_queued":
+            instruction = payload.get("instruction", "")
+            return f"Architect brief queued: {instruction}"
+        if event_type == "failure_memory_guidance_used":
+            guidance = payload.get("guidance_excerpt", "")
+            return f"Failure memory guidance used: {guidance}"
+        return f"{event_type}: {payload}"
 
     def queue_architect_instruction(self, instruction: str, source: str = "chat") -> None:
         clean = (instruction or "").strip()
@@ -486,6 +1137,11 @@ class SwarmController:
             self.artifacts.append_progress(
                 f"Queued architect instruction from {source}: {clean[:180]}"
             )
+        self._record_swarm_feed(
+            "architect",
+            "Architect brief queued",
+            f"{source}: {clean}",
+        )
 
     def respond_to_chat(
         self,
@@ -515,11 +1171,13 @@ class SwarmController:
             mode=chat_mode,
             message_text=message_text,
             status=status,
+            conversation_context=conversation_context,
         )
         reply = parsed.get("reply") or self._fallback_chat_reply(
             mode=chat_mode,
             message_text=message_text,
             status=status,
+            conversation_context=conversation_context,
         )
         background_instruction = parsed.get("background_instruction", "").strip()
         swarm_health = parsed.get("swarm_health", "").strip()
@@ -543,13 +1201,30 @@ class SwarmController:
 
     def _normalize_chat_mode(self, mode: str, message_text: str) -> str:
         clean = (mode or "chat").strip().lower()
-        if clean in {"health", "architect", "chat"}:
+        if clean in {"health", "architect", "chat", "recap"}:
             return clean
         text = (message_text or "").strip().lower()
         if text.startswith("/health"):
             return "health"
         if text.startswith("/architect"):
             return "architect"
+        if text.startswith("/recap"):
+            return "recap"
+        if any(
+            phrase in text
+            for phrase in (
+                "show me the chats",
+                "show the chats",
+                "what happened so far",
+                "what has happened so far",
+                "conversation history",
+                "chat history",
+                "summarize the chat",
+                "catch me up",
+                "recap the conversation",
+            )
+        ):
+            return "recap"
         return "chat"
 
     def _build_chat_prompt(
@@ -567,6 +1242,7 @@ class SwarmController:
             "- chat: answer conversationally and briefly.",
             "- health: summarize swarm health, blockers, and next useful action.",
             "- architect: give a concise reply and a compact background instruction for the main swarm architect.",
+            "- recap: summarize the recent conversation visible below, using only the provided transcript. Do not say you cannot access history; you can see the Recent conversation block.",
             "Swarm status:",
             f"state={status.get('state', 'IDLE')}; phase={status.get('phase', 'PREPARING')}; ",
             f"wave={status.get('wave_name', 'BASELINE')} ({status.get('wave_index', 0)}); ",
@@ -594,6 +1270,7 @@ class SwarmController:
         mode: str,
         message_text: str,
         status: Dict[str, object],
+        conversation_context: str = "",
     ) -> Dict[str, str]:
         payload: Dict[str, str] = {}
         text = (raw or "").strip()
@@ -616,7 +1293,12 @@ class SwarmController:
         background_instruction = payload.get("background_instruction", "").strip()
         mode_value = payload.get("mode", mode).strip() or mode
         if not reply:
-            reply = self._fallback_chat_reply(mode=mode_value, message_text=message_text, status=status)
+            reply = self._fallback_chat_reply(
+                mode=mode_value,
+                message_text=message_text,
+                status=status,
+                conversation_context=conversation_context,
+            )
         return {
             "reply": reply,
             "background_instruction": background_instruction,
@@ -629,6 +1311,7 @@ class SwarmController:
         mode: str,
         message_text: str,
         status: Dict[str, object],
+        conversation_context: str = "",
     ) -> str:
         if mode == "health":
             return (
@@ -640,8 +1323,14 @@ class SwarmController:
                 "I queued a concise architect brief and kept the local chat lane open. "
                 "Tell me the next change or ask for a swarm health check."
             )
+        if mode == "recap":
+            lines = [line.strip() for line in conversation_context.splitlines() if line.strip()]
+            if lines:
+                recap = "\n".join(f"- {line}" for line in lines[-12:])
+                return "Here's the recent conversation I can see in this session:\n" + recap
+            return "I don't see any prior chat messages in this session yet."
         return (
-            "I’m here and the local lane is open. "
+            "I'm here and the local lane is open. "
             "Ask for swarm health, request architect changes, or keep chatting."
         )
 
@@ -862,6 +1551,14 @@ class SwarmController:
         self.snapshot.local_memory_packet_count = int(memory_status.get("packet_count", 0))
         self.snapshot.local_memory_reuse_count = int(memory_status.get("reuse_count", 0))
         self.snapshot.local_memory_invalidations = int(memory_status.get("invalidations", 0))
+        self.snapshot.local_memory_pressure = float(memory_status.get("latest_pressure", 0.0))
+        self.snapshot.local_memory_compaction_triggered = bool(
+            memory_status.get("compaction_triggered", False)
+        )
+        self.snapshot.latest_local_memory_pressure = float(memory_status.get("latest_pressure", 0.0))
+        self.snapshot.latest_local_memory_compaction_reason = str(
+            memory_status.get("latest_compaction_reason", "")
+        )[:280]
         self.snapshot.local_api_inflight = int(self.local_governor.status().get("inflight", 0))
         self.snapshot.local_api_throttle_hits = int(
             self.local_governor.status().get("throttle_hits", 0)
@@ -870,11 +1567,26 @@ class SwarmController:
         self.snapshot.local_api_user_waiting = int(governor_status.get("user_waiting", 0))
         self.snapshot.local_api_swarm_waiting = int(governor_status.get("swarm_waiting", 0))
         self.snapshot.local_api_last_lane = str(governor_status.get("last_lane", "swarm"))
+        self.snapshot.local_model_host = self.local_model_host
+        self.snapshot.local_model_routes = self.local_model_routes
+        self.snapshot.latest_local_model_name = self.latest_local_model_name
+        self.snapshot.latest_local_model_lane = self.latest_local_model_lane
         self.snapshot.latest_local_memory_note = str(memory_status.get("latest_note", ""))[:280]
         self.snapshot.latest_local_memory_agent = str(memory_status.get("latest_agent", ""))[:140]
         self.snapshot.latest_local_memory_task_family = str(
             memory_status.get("latest_task_family", "")
         )[:140]
+        generation_status = self.generation_memory.status()
+        self.snapshot.generation_memory_records = int(generation_status.get("record_count", 0))
+        self.snapshot.generation_memory_restores = int(generation_status.get("restore_count", 0))
+        self.snapshot.generation_memory_latest_generation_id = str(
+            generation_status.get("latest_generation_id", "")
+        )[:140]
+        self.snapshot.generation_memory_latest_aspiration = str(
+            generation_status.get("latest_aspiration", "")
+        )[:280]
+        self.snapshot.generation_memory_latest_note = str(generation_status.get("latest_note", ""))[:280]
+        self.snapshot.generation_memory_path = str(generation_status.get("base_dir", ""))[:260]
         self.snapshot.standard_test_fallback_count = self.standard_test_fallback_count
         self.snapshot.latest_standard_test_reason = self.latest_standard_test_reason[:280]
         self.snapshot.latest_standard_test_pack = self.latest_standard_test_pack[:280]
@@ -1940,6 +2652,43 @@ class SwarmController:
                 )
                 if guidance:
                     support_notes.append(guidance)
+            restore_requested = purpose in {"recap", "restore", "memory"}
+            task_family_restoreable = (
+                purpose in {"implementation", "fix-pass", "testing", "judge", "review"}
+                and (
+                    bool(self.last_failure_context)
+                    or self.returned_failure_streak > 0
+                    or not self.agent_memory.has_active_packet(agent.name, family)
+                )
+            )
+            should_restore_lineage = bool(
+                config.generation_memory_enabled
+                and config.generation_memory_restore_enabled
+                and (restore_requested or task_family_restoreable)
+            )
+            if should_restore_lineage:
+                restored = self.generation_memory.restore(
+                    agent_name=agent.name,
+                    task_family=family,
+                    task_prompt=working_prompt,
+                    failure_context=self.last_failure_context if purpose != "testing" else "",
+                    max_records=config.generation_memory_restore_limit,
+                    max_chars=config.local_memory_max_chars,
+                )
+                if restored.restored and restored.content:
+                    support_notes.append(restored.content)
+                    generation_status = self.generation_memory.status()
+                    with self._lock:
+                        self.generation_memory_records = int(generation_status.get("record_count", 0))
+                        self.generation_memory_restores = int(generation_status.get("restore_count", 0))
+                        self.generation_memory_latest_generation_id = str(
+                            generation_status.get("latest_generation_id", "")
+                        )
+                        self.generation_memory_latest_aspiration = str(
+                            generation_status.get("latest_aspiration", "")
+                        )
+                        self.generation_memory_latest_note = str(generation_status.get("latest_note", ""))
+                        self.generation_memory_path = str(generation_status.get("base_dir", ""))
             memory_recall = self.agent_memory.prepare(
                 agent_name=agent.name,
                 task_family=family,
@@ -1948,6 +2697,7 @@ class SwarmController:
                 support_notes=support_notes,
                 force_refresh=not config.local_memory_reuse_enabled,
                 max_chars=config.local_memory_max_chars,
+                pressure_threshold=config.local_memory_pressure_threshold,
             )
             if memory_recall.content:
                 working_prompt = (
@@ -1958,10 +2708,18 @@ class SwarmController:
                     self.latest_local_memory_note = memory_recall.note[:280]
                     self.latest_local_memory_agent = agent.name[:140]
                     self.latest_local_memory_task_family = family[:140]
+                    self.latest_local_memory_pressure = float(memory_recall.pressure or 0.0)
+                    self.latest_local_memory_compaction_reason = memory_recall.compaction_reason[:280]
+                    self.local_memory_pressure = float(memory_recall.pressure or 0.0)
+                    self.local_memory_compaction_triggered = bool(memory_recall.compacted)
                     self._save_state()
                 if self.artifacts:
                     self.artifacts.append_event(
-                        "local_memory_primed" if not memory_recall.reused else "local_memory_reused",
+                        "local_memory_compacted"
+                        if memory_recall.compacted
+                        else "local_memory_primed"
+                        if not memory_recall.reused
+                        else "local_memory_reused",
                         {
                             "agent_name": agent.name,
                             "task_family": family,
@@ -1969,6 +2727,9 @@ class SwarmController:
                             "reused": memory_recall.reused,
                             "refreshed": memory_recall.refreshed,
                             "note": memory_recall.note,
+                            "pressure": memory_recall.pressure,
+                            "compacted": memory_recall.compacted,
+                            "compaction_reason": memory_recall.compaction_reason,
                         },
                     )
 
@@ -2550,3 +3311,10 @@ class SwarmController:
             event_type = "run_failed_quality_gate" if mark_failed else "run_complete"
             self.artifacts.append_event(event_type, {"status": status})
             self.artifacts.append_progress(status)
+        self._record_swarm_feed(
+            "run",
+            "Run finished",
+            status,
+        )
+
+

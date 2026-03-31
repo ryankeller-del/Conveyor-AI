@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from modular_belt import Agent, ContextBelt, Orchestrator
+from swarm_core.local_models import desktop_ollama_base_url, desktop_ollama_target
 
 load_dotenv()
 
@@ -25,12 +26,15 @@ groq_client = OpenAI(
     api_key=os.getenv("GROQ_API_KEY"),
     base_url="https://api.groq.com/openai/v1",
 )
-local_client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
+local_client = OpenAI(base_url=desktop_ollama_base_url(), api_key="ollama")
 
 
-def _is_local_llm_available(host: str = "127.0.0.1", port: int = 11434, timeout: float = 0.5) -> bool:
+def _is_local_llm_available(host: str | None = None, port: int | None = None, timeout: float = 0.5) -> bool:
+    resolved_host, resolved_port = host, port
+    if resolved_host is None or resolved_port is None:
+        resolved_host, resolved_port = desktop_ollama_target()
     try:
-        with socket.create_connection((host, port), timeout=timeout):
+        with socket.create_connection((resolved_host, resolved_port), timeout=timeout):
             return True
     except OSError:
         return False

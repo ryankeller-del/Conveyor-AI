@@ -80,6 +80,7 @@ def test_rolling_conversation_trims_oldest_visible_messages():
 def test_detect_chat_mode_and_swarm_launch_helpers():
     assert detect_chat_mode("/health") == "health"
     assert detect_chat_mode("Please act as master architect") == "architect"
+    assert detect_chat_mode("show me the chats that have happened so far") == "recap"
     assert detect_chat_mode("hello there") == "chat"
     assert should_launch_swarm("/swarm build the api") is True
     assert should_launch_swarm("/runjson {}") is False
@@ -109,3 +110,27 @@ def test_controller_chat_request_queues_architect_instruction(tmp_path: Path):
     assert status["queued_architect_instruction_count"] == 1
     assert "chat lane open" in status["latest_architect_instruction"].lower()
     assert status["chat_mode"] == "architect"
+
+
+def test_controller_chat_recap_uses_recent_conversation_context(tmp_path: Path):
+    controller = SwarmController(
+        test_agent=_agent("test", client=_JsonClient('{"reply":"test","background_instruction":"","swarm_health":"","mode":"chat"}')),
+        coder_agent=_agent("coder", client=_JsonClient('{"reply":"coder","background_instruction":"","swarm_health":"","mode":"chat"}')),
+        judge_agent=_agent("judge", client=_JsonClient('{"reply":"judge","background_instruction":"","swarm_health":"","mode":"chat"}')),
+        root_dir=str(tmp_path),
+        chat_agent=_agent(
+            "chat",
+            client=_JsonClient('{"reply":"","background_instruction":"","swarm_health":"","mode":"recap"}'),
+            local=True,
+        ),
+    )
+
+    result = controller.respond_to_chat(
+        "show me the chats that have happened so far",
+        mode="recap",
+        conversation_context="User: hello there\nAssistant: hi! here is the local lane.\nUser: what happened so far?",
+    )
+
+    assert result["mode"] == "recap"
+    assert "recent conversation" in result["reply"].lower()
+    assert "hello there" in result["reply"].lower()

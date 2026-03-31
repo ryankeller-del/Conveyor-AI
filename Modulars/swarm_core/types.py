@@ -154,7 +154,11 @@ class RunConfig:
     local_memory_enabled: bool = True
     local_memory_reuse_enabled: bool = True
     local_memory_max_chars: int = 1800
+    local_memory_pressure_threshold: float = 0.78
     local_memory_invalidate_on_failure: bool = True
+    generation_memory_enabled: bool = True
+    generation_memory_restore_enabled: bool = True
+    generation_memory_restore_limit: int = 3
     local_api_throttle_enabled: bool = True
     local_api_max_inflight: int = 1
     local_api_min_interval_seconds: float = 0.35
@@ -250,14 +254,28 @@ class RunSnapshot:
     local_memory_packet_count: int = 0
     local_memory_reuse_count: int = 0
     local_memory_invalidations: int = 0
+    local_memory_pressure: float = 0.0
+    local_memory_compaction_triggered: bool = False
+    latest_local_memory_pressure: float = 0.0
+    latest_local_memory_compaction_reason: str = ""
     local_api_inflight: int = 0
     local_api_throttle_hits: int = 0
     local_api_user_waiting: int = 0
     local_api_swarm_waiting: int = 0
     local_api_last_lane: str = "swarm"
+    local_model_host: str = ""
+    local_model_routes: Dict[str, Dict[str, List[str] | str]] = field(default_factory=dict)
+    latest_local_model_name: str = ""
+    latest_local_model_lane: str = ""
     latest_local_memory_note: str = ""
     latest_local_memory_agent: str = ""
     latest_local_memory_task_family: str = ""
+    generation_memory_records: int = 0
+    generation_memory_restores: int = 0
+    generation_memory_latest_generation_id: str = ""
+    generation_memory_latest_aspiration: str = ""
+    generation_memory_latest_note: str = ""
+    generation_memory_path: str = ""
     returned_failure_streak: int = 0
     standard_test_fallback_count: int = 0
     latest_standard_test_reason: str = ""
@@ -267,6 +285,15 @@ class RunSnapshot:
     chat_turn_count: int = 0
     queued_architect_instruction_count: int = 0
     latest_architect_instruction: str = ""
+    background_run_queue_depth: int = 0
+    background_run_active_goal: str = ""
+    background_run_last_run_id: str = ""
+    background_run_last_status: str = ""
+    filesystem_queue_depth: int = 0
+    filesystem_active_target: str = ""
+    filesystem_last_path: str = ""
+    filesystem_last_status: str = ""
+    filesystem_last_result: str = ""
     ui_suggestions: List[str] = field(default_factory=list)
     ui_warnings: List[str] = field(default_factory=list)
     directives_active: bool = True

@@ -1,11 +1,17 @@
 import time
+import sys
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from bot_profiles_v3 import build_swarm_profiles
 from swarm_core.bots import JudgeBot, SimpleAgent
 from swarm_core.compaction import DistillationLoop
 from swarm_core.controller import SwarmController
 from swarm_core.efficiency import EfficiencyAnalyzer
-from swarm_core.local_runtime import AgentMemoryManager, LocalCallGovernor
+from swarm_core.local_runtime import AgentMemoryManager, GenerationMemoryArchive, LocalCallGovernor, MemoryPacket
 from swarm_core.rehearsal import OfflineRehearsalManager, stage_manifest_from_snapshot
 from swarm_core.preflight import SwarmPreflightManager
 from swarm_core.standard_tests import StandardTestLibrary
@@ -14,7 +20,7 @@ from swarm_core.skill_evolution import SkillEvolutionManager
 from swarm_core.spawn import AgentDescriptor, AgentRegistry, SpawnManager
 from swarm_core.stability_guard import StabilityGuard
 from swarm_core.team_collab import BrainstormEngine, TeamComparator
-from swarm_core.types import RunConfig, RunMetrics, TaskGoal, TestSpec
+from swarm_core.types import RunConfig, RunMetrics, RunState, TaskGoal, TestSpec
 
 
 class _FakeClient:
@@ -89,6 +95,68 @@ class _SelectiveClient:
 
                 class _Choice:
                     message = _Msg()
+
+                class _Resp:
+                    choices = [_Choice()]
+
+                return _Resp()
+
+        @property
+        def completions(self):
+            return self._Completions(self._outer)
+
+    @property
+    def chat(self):
+        return self._Chat(self)
+
+
+class _MessageClient:
+    class _Chat:
+        class _Completions:
+            def create(self, **kwargs):
+                class _Msg:
+                    content = "agent narrative response"
+
+                class _Choice:
+                    message = _Msg()
+
+                class _Resp:
+                    choices = [_Choice()]
+
+                return _Resp()
+
+        completions = _Completions()
+
+    chat = _Chat()
+
+
+class _RecordingClient:
+    def __init__(self, content="agent narrative response"):
+        self.content = content
+        self.last_messages = []
+        self.last_model = ""
+
+    class _Chat:
+        def __init__(self, outer):
+            self._outer = outer
+
+        class _Completions:
+            def __init__(self, outer):
+                self._outer = outer
+
+            def create(self, **kwargs):
+                self._outer.last_model = kwargs.get("model", "")
+                self._outer.last_messages = kwargs.get("messages", [])
+                content = self._outer.content
+
+                class _Msg:
+                    pass
+
+                msg = _Msg()
+                msg.content = content
+
+                class _Choice:
+                    message = msg
 
                 class _Resp:
                     choices = [_Choice()]
@@ -233,6 +301,101 @@ def test_controller_status_has_wave_topology_and_recommendation(tmp_path: Path):
     assert "local_api_inflight" in status
     assert "local_api_throttle_hits" in status
     assert "latest_local_memory_note" in status
+    assert "background_run_queue_depth" in status
+    assert "background_run_active_goal" in status
+    assert "background_run_last_run_id" in status
+    assert "background_run_last_status" in status
+    assert "local_model_host" in status
+    assert "local_model_routes" in status
+    assert "latest_local_model_name" in status
+    assert "latest_local_model_lane" in status
+    assert "local_memory_pressure" in status
+    assert "local_memory_compaction_triggered" in status
+
+
+def test_swarm_profiles_prioritize_desktop_local_routes():
+    profiles = build_swarm_profiles()
+    assert profiles["chat"].model == "glm-4.7-flash:q4_K_M"
+    assert profiles["coder"].model == "qwen2.5-coder:14b"
+    assert "deepseek-r1:32b" in profiles["judge"].fallback_models
+    assert all(
+        "ocr" not in model.lower() and "pose" not in model.lower()
+        for profile in profiles.values()
+        for model in [profile.model, *profile.fallback_models]
+    )
+
+
+def test_background_run_queue_serializes_launches(tmp_path: Path):
+    controller = SwarmController(
+        test_agent=_agent("test"),
+        coder_agent=_agent("coder"),
+        judge_agent=_agent("judge"),
+        root_dir=str(tmp_path),
+    )
+    launches = []
+
+    def _fake_start(goal, config=None):
+        launches.append(goal.prompt)
+        controller.snapshot.state = RunState.COMPLETE
+        return f"run-{len(launches)}"
+
+    controller.start = _fake_start  # type: ignore[method-assign]
+
+    controller.queue_background_run(
+        TaskGoal(prompt="first background goal", target_files=["app_v3.py"], language="general"),
+        RunConfig(),
+        source="chat",
+    )
+    controller.queue_background_run(
+        TaskGoal(prompt="second background goal", target_files=["app_v3.py"], language="general"),
+        RunConfig(),
+        source="chat",
+    )
+
+    deadline = time.time() + 2.0
+    while time.time() < deadline and len(launches) < 2:
+        time.sleep(0.05)
+
+    assert launches == ["first background goal", "second background goal"]
+    status = controller.status()
+    assert status["background_run_queue_depth"] == 0
+    assert status["background_run_last_status"].startswith("completed")
+
+
+def test_filesystem_queue_creates_folder_and_file(tmp_path: Path):
+    modulars_root = tmp_path / "Modulars"
+    modulars_root.mkdir()
+    controller = SwarmController(
+        test_agent=_agent("test"),
+        coder_agent=_agent("coder"),
+        judge_agent=_agent("judge"),
+        root_dir=str(modulars_root),
+    )
+
+    queue_id = controller.queue_filesystem_creation(
+        folder_name="buttnutt",
+        files=[{"name": "hello.js", "content": 'const helloWorld = "Hello, world!";\n'}],
+        scope="repo_root",
+        source="chat",
+        note="javascript hello world request",
+    )
+    assert queue_id
+
+    target_file = tmp_path / "buttnutt" / "hello.js"
+    deadline = time.time() + 2.0
+    while time.time() < deadline and not target_file.exists():
+        time.sleep(0.05)
+
+    assert target_file.exists()
+    assert "Hello, world!" in target_file.read_text(encoding="utf-8")
+    status = controller.status()
+    assert status["filesystem_queue_depth"] == 0
+    assert status["filesystem_last_status"].startswith("created")
+    assert "hello.js" in status["filesystem_last_result"]
+    assert "background_run_queue_depth" in status
+    assert "background_run_active_goal" in status
+    assert "background_run_last_run_id" in status
+    assert "background_run_last_status" in status
 
 
 def test_team_comparison_and_brainstorm_detects_novel_signatures(tmp_path: Path):
@@ -335,6 +498,130 @@ def test_agent_memory_manager_exposes_specialist_profiles(tmp_path: Path):
     assert profile["task_family"] == "implementation"
     assert "current_expert_trend" in profile
     assert profile["current_expert_trend"] in {"forming", "stable", "strengthening", "emerging"}
+
+
+def test_generation_memory_archive_captures_and_restores(tmp_path: Path):
+    archive = GenerationMemoryArchive(str(tmp_path / "generation_memory"))
+    archive.begin_generation("gen-1", "Keep the swarm focused on testable changes.", "gen-0")
+    packet = MemoryPacket(
+        packet_id="pkt-1",
+        agent_name="LocalCoder",
+        task_family="implementation",
+        generation_id="gen-1",
+        content="Keep edits small and preserve tests.",
+        signature="sig-1",
+        created_at="2026-03-30T00:00:00Z",
+        aspiration_prompt="Keep the swarm focused on testable changes.",
+        source_notes=["Prefer small edits."],
+        last_outcome="success",
+    )
+    captured = archive.capture_packet(
+        packet=packet,
+        reason="culled after replacement",
+        aspiration_prompt="Keep the swarm focused on testable changes.",
+    )
+    assert captured is not None
+    assert list((tmp_path / "generation_memory" / "raw").glob("*.json"))
+
+    restored = archive.restore(
+        agent_name="LocalCoder",
+        task_family="implementation",
+        task_prompt="continue the parser work",
+        failure_context="previous attempt failed validation",
+        max_records=2,
+    )
+    assert restored.restored is True
+    assert "Keep the swarm focused" in restored.content
+    assert "GENERATION MEMORY RESTORE" in restored.content
+
+    status = archive.status()
+    assert status["record_count"] >= 2
+    assert status["restore_count"] >= 1
+    assert status["latest_aspiration"]
+
+
+def test_controller_uses_generation_memory_on_demand(tmp_path: Path):
+    client = _RecordingClient()
+    agent = SimpleAgent(
+        name="coder",
+        system_prompt="",
+        client=client,
+        model="primary-model",
+        is_local=True,
+    )
+    controller = SwarmController(
+        test_agent=_agent("test"),
+        coder_agent=agent,
+        judge_agent=_agent("judge"),
+        root_dir=str(tmp_path),
+    )
+    controller.generation_memory.begin_generation("gen-9", "Preserve the intent to keep edits small.")
+    controller.generation_memory.capture_packet(
+        MemoryPacket(
+            packet_id="pkt-9",
+            agent_name="coder",
+            task_family="implementation",
+            generation_id="gen-9",
+            content="Keep edits narrow and validate every change.",
+            signature="sig-9",
+            created_at="2026-03-30T00:00:00Z",
+            aspiration_prompt="Preserve the intent to keep edits small.",
+            source_notes=["Prefer narrow edits."],
+            last_outcome="success",
+        ),
+        reason="culled after a generation change",
+        aspiration_prompt="Preserve the intent to keep edits small.",
+    )
+
+    response = controller._safe_generate(
+        agent=agent,
+        prompt="Implement the feature carefully.",
+        purpose="implementation",
+        config=RunConfig(
+            max_waves=1,
+            max_total_tests=2,
+            prompt_guard_enabled=False,
+            generation_memory_enabled=True,
+            generation_memory_restore_enabled=True,
+        ),
+        task_family="implementation",
+    )
+
+    assert response == "agent narrative response"
+    prompt_text = " ".join(
+        str(item.get("content", "")) for item in client.last_messages if isinstance(item, dict)
+    )
+    assert "GENERATION MEMORY RESTORE" in prompt_text
+    status = controller.status()
+    assert status["generation_memory_records"] >= 2
+    assert status["generation_memory_restores"] >= 1
+    assert status["generation_memory_latest_aspiration"]
+
+
+def test_agent_memory_manager_auto_compacts_on_pressure(tmp_path: Path):
+    manager = AgentMemoryManager(str(tmp_path / "agent_memory"), max_packet_chars=240)
+    first = manager.prepare(
+        agent_name="LocalChatBot",
+        task_family="chat",
+        task_prompt="Explain a simple change for the user in a few short sentences.",
+        support_notes=["Prefer concise responses."],
+    )
+    assert first.reused is False
+
+    second = manager.prepare(
+        agent_name="LocalChatBot",
+        task_family="chat",
+        task_prompt="Explain a simple change for the user in a few short sentences.",
+        support_notes=["Prefer concise responses.", "Keep the response short."],
+        pressure_threshold=0.2,
+    )
+    assert second.reused is False
+    assert second.compacted is True
+    assert second.pressure >= 0.2
+    status = manager.status()
+    assert status["compaction_triggered"] is True
+    assert status["latest_pressure"] >= 0.2
+    assert "auto-compacted" in status["latest_compaction_reason"]
 
 
 def test_standard_test_library_resolves_role_and_failure_patterns():
@@ -832,3 +1119,26 @@ def test_live_controller_accepts_better_stage_manifest_without_restart(tmp_path:
     rejected = controller.apply_stage_manifest(worse_manifest)
     assert rejected is False
     assert controller.live_stage_manifest.current_stage == "STABILIZATION"
+
+
+def test_agent_messages_are_recorded_in_swarm_feed(tmp_path: Path):
+    agent = SimpleAgent(name="narrator", system_prompt="", client=_MessageClient(), model="primary")
+    controller = SwarmController(
+        test_agent=_agent("test"),
+        coder_agent=agent,
+        judge_agent=_agent("judge"),
+        root_dir=str(tmp_path),
+    )
+
+    response = controller._safe_generate(
+        agent=agent,
+        prompt="Say something short.",
+        purpose="chat",
+        config=RunConfig(max_waves=1, max_total_tests=2),
+        task_family="chat",
+    )
+
+    assert "agent narrative response" in response
+    narrative = controller.recent_swarm_narrative(limit=10)
+    assert any("narrator" in entry.get("headline", "").lower() for entry in narrative)
+    assert any("agent narrative response" in entry.get("text", "").lower() for entry in narrative)

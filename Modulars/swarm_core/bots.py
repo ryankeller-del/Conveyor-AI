@@ -6,7 +6,7 @@ import re
 import shlex
 import subprocess
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 from .types import TestSpec
 
@@ -21,6 +21,7 @@ class SimpleAgent:
     fallback_client: object = None
     fallback_client_models: List[str] = None
     is_local: bool = False
+    message_sink: Any = None
 
     def generate(self, prompt: str) -> str:
         primary_models = [self.model] + list(self.fallback_models or [])
@@ -38,6 +39,7 @@ class SimpleAgent:
                 )
                 content = response.choices[0].message.content
                 if content:
+                    self._emit_message(model=model, prompt=prompt, content=content, lane="primary")
                     return content
             except Exception:
                 continue
@@ -57,10 +59,26 @@ class SimpleAgent:
                 )
                 content = response.choices[0].message.content
                 if content:
+                    self._emit_message(model=model, prompt=prompt, content=content, lane="fallback-client")
                     return content
             except Exception:
                 continue
         return ""
+
+    def _emit_message(self, model: str, prompt: str, content: str, lane: str) -> None:
+        sink = self.message_sink
+        if not callable(sink):
+            return
+        try:
+            sink(
+                agent_name=self.name,
+                model=model,
+                lane=lane,
+                prompt=prompt,
+                content=content,
+            )
+        except Exception:
+            pass
 
 
 class TestBot:

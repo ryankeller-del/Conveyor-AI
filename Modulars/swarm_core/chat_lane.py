@@ -64,6 +64,8 @@ def detect_chat_mode(text: str) -> str:
         return "health"
     if normalized.startswith("/architect"):
         return "architect"
+    if normalized.startswith("/recap"):
+        return "recap"
     if normalized.startswith("/chat"):
         return "chat"
     if any(
@@ -88,6 +90,21 @@ def detect_chat_mode(text: str) -> str:
         )
     ):
         return "architect"
+    if any(
+        phrase in normalized
+        for phrase in (
+            "show me the chats",
+            "show the chats",
+            "what happened so far",
+            "what has happened so far",
+            "conversation history",
+            "chat history",
+            "summarize the chat",
+            "catch me up",
+            "recap the conversation",
+        )
+    ):
+        return "recap"
     return "chat"
 
 

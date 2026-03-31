@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import builtins
 import os
 import re
@@ -30,13 +31,18 @@ class HallucinationGuard:
         project_graph = self._build_project_graph()
         reachable_symbols = self._reachable_symbols(project_graph, target_file)
 
-        referenced_symbols = self._extract_call_symbols(code)
+        referenced_symbols = self._extract_call_symbols(code, target_file)
         unknown_symbols = sorted(
             symbol for symbol in referenced_symbols if symbol not in reachable_symbols
         )
 
-        imported_roots = self._extract_import_roots(code)
-        unknown_apis = self._detect_unknown_apis(code, imported_roots, reachable_symbols)
+        imported_roots = self._extract_import_roots(code, target_file)
+        unknown_apis = self._detect_unknown_apis(
+            code,
+            imported_roots,
+            reachable_symbols,
+            target_file,
+        )
 
         missing_doc_grounding = False
         if doc_grounding_enabled and self._contains_external_claims(prompt):
@@ -81,8 +87,8 @@ class HallucinationGuard:
                         content = handle.read()
                 except Exception:
                     continue
-                exports = set(self._extract_defined_symbols(content))
-                imports = set(self._extract_import_roots(content))
+                exports = set(self._extract_defined_symbols(content, path))
+                imports = set(self._extract_import_roots(content, path))
                 graph[rel] = {"exports": exports, "imports": imports}
         return graph
 
@@ -109,7 +115,12 @@ class HallucinationGuard:
 
         return known
 
-    def _extract_defined_symbols(self, code: str) -> List[str]:
+    def _extract_defined_symbols(self, code: str, file_path: str = "") -> List[str]:
+        if self._is_python_file(file_path):
+            parsed = self._safe_python_ast(code)
+            if parsed is not None:
+                return sorted(set(self._extract_python_defined_symbols(parsed)))
+
         py_defs = re.findall(r"^def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", code, flags=re.M)
         py_classes = re.findall(r"^class\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*[:(]", code, flags=re.M)
         js_defs = re.findall(r"\bfunction\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", code)
@@ -120,7 +131,12 @@ class HallucinationGuard:
         )
         return list(set(py_defs + py_classes + js_defs + js_classes + cs_members))
 
-    def _extract_import_roots(self, code: str) -> List[str]:
+    def _extract_import_roots(self, code: str, file_path: str = "") -> List[str]:
+        if self._is_python_file(file_path):
+            parsed = self._safe_python_ast(code)
+            if parsed is not None:
+                return sorted(set(self._extract_python_import_roots(parsed)))
+
         roots: List[str] = []
         py_imports = re.findall(r"^import\s+([a-zA-Z0-9_\.]+)", code, flags=re.M)
         py_from = re.findall(r"^from\s+([a-zA-Z0-9_\.]+)\s+import", code, flags=re.M)
@@ -132,7 +148,12 @@ class HallucinationGuard:
                 roots.append(root)
         return list(set(roots))
 
-    def _extract_call_symbols(self, code: str) -> List[str]:
+    def _extract_call_symbols(self, code: str, file_path: str = "") -> List[str]:
+        if self._is_python_file(file_path):
+            parsed = self._safe_python_ast(code)
+            if parsed is not None:
+                return sorted(set(self._extract_python_call_symbols(parsed)))
+
         calls = re.findall(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", code)
         ignore = {"if", "for", "while", "return", "switch", "catch", "typeof"}
         return list({call for call in calls if call not in ignore})
@@ -142,14 +163,99 @@ class HallucinationGuard:
         code: str,
         imported_roots: List[str],
         reachable_symbols: Set[str],
+        file_path: str = "",
     ) -> List[str]:
         known_roots = set(imported_roots) | reachable_symbols
-        dotted = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\(", code)
+        if self._is_python_file(file_path):
+            dotted = self._extract_python_dotted_calls(code)
+        else:
+            dotted = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\(", code)
         unknown = []
         for root, method in dotted:
             if root not in known_roots and root not in dir(builtins):
                 unknown.append(f"{root}.{method}")
         return sorted(set(unknown))
+
+    def _extract_python_defined_symbols(self, tree: ast.AST) -> List[str]:
+        symbols: List[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                symbols.append(node.name)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    symbols.extend(self._extract_assignment_targets(target))
+            elif isinstance(node, ast.AnnAssign):
+                symbols.extend(self._extract_assignment_targets(node.target))
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    symbols.append(alias.asname or alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    symbols.append(alias.asname or alias.name.split(".")[0])
+        return symbols
+
+    def _extract_python_import_roots(self, tree: ast.AST) -> List[str]:
+        roots: List[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    roots.append(alias.name.split(".")[0])
+                    if alias.asname:
+                        roots.append(alias.asname)
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    roots.append(node.module.split(".")[0])
+                for alias in node.names:
+                    roots.append(alias.asname or alias.name.split(".")[0])
+        return roots
+
+    def _extract_python_call_symbols(self, tree: ast.AST) -> List[str]:
+        symbols: List[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Name):
+                    symbols.append(func.id)
+        return symbols
+
+    def _extract_python_dotted_calls(self, code: str) -> List[tuple]:
+        parsed = self._safe_python_ast(code)
+        if parsed is None:
+            return []
+        dotted = []
+        for node in ast.walk(parsed):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                root = self._attribute_root(node.func.value)
+                if root:
+                    dotted.append((root, node.func.attr))
+        return dotted
+
+    def _attribute_root(self, node: ast.AST) -> str:
+        current = node
+        while isinstance(current, ast.Attribute):
+            current = current.value
+        if isinstance(current, ast.Name):
+            return current.id
+        return ""
+
+    def _extract_assignment_targets(self, target: ast.AST) -> List[str]:
+        if isinstance(target, ast.Name):
+            return [target.id]
+        if isinstance(target, (ast.Tuple, ast.List)):
+            results: List[str] = []
+            for item in target.elts:
+                results.extend(self._extract_assignment_targets(item))
+            return results
+        return []
+
+    def _safe_python_ast(self, code: str) -> ast.AST | None:
+        try:
+            return ast.parse(code)
+        except Exception:
+            return None
+
+    def _is_python_file(self, file_path: str) -> bool:
+        return os.path.splitext(str(file_path or ""))[1].lower() == ".py"
 
     def _contains_external_claims(self, text: str) -> bool:
         lowered = (text or "").lower()

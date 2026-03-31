@@ -1,5 +1,6 @@
 import time
 import sys
+import threading
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -11,6 +12,8 @@ from swarm_core.bots import JudgeBot, SimpleAgent
 from swarm_core.compaction import DistillationLoop
 from swarm_core.controller import SwarmController
 from swarm_core.efficiency import EfficiencyAnalyzer
+from swarm_core.failure_memory import FailureMemory
+from swarm_core.hallucination_guard import HallucinationGuard
 from swarm_core.local_runtime import AgentMemoryManager, GenerationMemoryArchive, LocalCallGovernor, MemoryPacket
 from swarm_core.rehearsal import OfflineRehearsalManager, stage_manifest_from_snapshot
 from swarm_core.preflight import SwarmPreflightManager
@@ -649,6 +652,176 @@ def test_local_governor_throttles_back_to_back_calls():
         assert governor.status()["throttle_hits"] >= 1
     finally:
         governor.release(second)
+
+
+def test_local_governor_prioritizes_user_lane_over_swarm_queue():
+    governor = LocalCallGovernor(max_inflight=1, min_interval_seconds=0.0, queue_limit=4, backoff_seconds=0.01)
+    first = governor.acquire("SwarmCoder", "implementation", lane="swarm")
+    order = []
+
+    def _acquire(name, lane):
+        lease = governor.acquire(name, "implementation", lane=lane)
+        order.append(lane)
+        try:
+            pass
+        finally:
+            governor.release(lease)
+
+    swarm_thread = threading.Thread(target=_acquire, args=("QueuedSwarm", "swarm"), daemon=True)
+    user_thread = threading.Thread(target=_acquire, args=("QueuedUser", "user"), daemon=True)
+    swarm_thread.start()
+    time.sleep(0.05)
+    user_thread.start()
+    time.sleep(0.05)
+    governor.release(first)
+
+    deadline = time.time() + 2
+    while time.time() < deadline and len(order) < 1:
+        time.sleep(0.01)
+    assert order
+    assert order[0] == "user"
+    swarm_thread.join(timeout=2)
+    user_thread.join(timeout=2)
+
+
+def test_hallucination_guard_uses_ast_for_python_literals(tmp_path: Path):
+    target = tmp_path / "sample.py"
+    target.write_text(
+        "\n".join(
+            [
+                'def helper():',
+                '    return True',
+                '',
+                'def run():',
+                '    text = "fake_call() should not count"',
+                '    # ignored_fake_call()',
+                '    return helper()',
+                '',
+                'run()',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    guard = HallucinationGuard(str(tmp_path))
+    result = guard.evaluate(
+        target_file=str(target),
+        code=target.read_text(encoding="utf-8"),
+        prompt="Build the helper and keep the example simple.",
+    )
+    assert "fake_call" not in result.unknown_symbols
+    assert result.confidence > 0.8
+
+
+def test_distillation_loop_prefilters_boilerplate_context():
+    loop = DistillationLoop()
+    lines = [
+        "2026-03-30 19:57:03,213 [INFO] Heartbeat tick",
+        "2026-03-30 19:56:29,110 [INFO] D: drive - Total: 953.85 GB, Used: 89.52 GB, Free: 864.33 GB",
+        "Updated file C:\\OpenClaw\\ConveyorAI\\Modulars\\app.py for the next wave.",
+        "Memory distillation selected BLUEPRINT format.",
+        "Memory distillation selected BLUEPRINT format.",
+    ]
+    filtered = loop._prefilter_context_lines(lines)
+    assert any("Memory distillation selected BLUEPRINT format." in line for line in filtered)
+    assert all("Heartbeat" not in line for line in filtered)
+    assert all("drive - Total" not in line for line in filtered)
+    assert all("C:\\" not in line for line in filtered)
+
+
+def test_failure_memory_semantic_guidance_prefers_related_fix(tmp_path: Path):
+    memory = FailureMemory(str(tmp_path / "failure_memory"))
+    memory.log_failure(
+        prompt="Make numeric addition safe across parsed fields.",
+        code="value = left + right\n",
+        error_message="TypeError: unsupported operand type(s) for +: 'int' and 'str'",
+        wave_name="BASELINE",
+        target_file="app.py",
+        fix_summary="Convert numeric strings before addition and add guard rails.",
+    )
+    memory.log_failure(
+        prompt="Render the settings table cleanly.",
+        code="table.render()\n",
+        error_message="KeyError: missing table key",
+        wave_name="BASELINE",
+        target_file="ui.py",
+        fix_summary="Use a safe lookup and preserve defaults when the key is absent.",
+    )
+
+    guidance = memory.format_guidance(
+        prompt="Need to harden string-to-number addition.",
+        limit=1,
+        failure_context="addition between parsed string values and numeric totals",
+    )
+
+    assert "Convert numeric strings before addition" in guidance
+    assert "KeyError: missing table key" not in guidance
+
+
+def test_parallel_validations_overlap_work(tmp_path: Path):
+    controller = SwarmController(
+        test_agent=_agent("test"),
+        coder_agent=_agent("coder"),
+        judge_agent=_agent("judge"),
+        root_dir=str(tmp_path),
+    )
+    target = tmp_path / "app.py"
+    target.write_text("def run():\n    return True\n", encoding="utf-8")
+    specs = [TestSpec("baseline", "BASELINE", "def test_run():\n    assert True\n", str(target))]
+    goal = TaskGoal(prompt="build api", target_files=["app.py"], language="general")
+
+    def _slow_guard(*args, **kwargs):
+        time.sleep(0.2)
+        return type("G", (), {"confidence": 1.0, "alerts": [], "unknown_symbols": [], "unknown_apis": [], "missing_doc_grounding": False})()
+
+    def _slow_judge(*args, **kwargs):
+        time.sleep(0.2)
+        return True, "ok"
+
+    controller._evaluate_hallucination_guard = _slow_guard  # type: ignore[method-assign]
+    controller._evaluate_judge = _slow_judge  # type: ignore[method-assign]
+    cfg = RunConfig(hallucination_guard_enabled=True)
+
+    start = time.time()
+    guard_result, passed, output = controller._run_parallel_validations(
+        goal=goal,
+        generated_code="def run():\n    return True\n",
+        test_specs=specs,
+        config=cfg,
+        cycle_index=0,
+    )
+    elapsed = time.time() - start
+
+    assert elapsed < 0.35
+    assert guard_result is not None
+    assert passed is True
+    assert output == "ok"
+
+
+def test_chat_prompt_keeps_status_compact_for_plain_conversation(tmp_path: Path):
+    controller = SwarmController(
+        test_agent=_agent("test"),
+        coder_agent=_agent("coder"),
+        judge_agent=_agent("judge"),
+        root_dir=str(tmp_path),
+    )
+    status = controller.status()
+    chat_prompt = controller._build_chat_prompt(
+        message_text="hello there",
+        mode="chat",
+        status=status,
+        conversation_context="User: hello\nAssistant: hi",
+    )
+    health_prompt = controller._build_chat_prompt(
+        message_text="/health",
+        mode="health",
+        status=status,
+        conversation_context="",
+    )
+    assert "background_queue=" in chat_prompt
+    assert "active_topology=" not in chat_prompt
+    assert "latest_architect_instruction=" not in chat_prompt
+    assert "active_topology=" in health_prompt
+    assert "latest_architect_instruction=" in health_prompt
 
 
 def test_spawn_manager_blocks_when_cooldown_violation():

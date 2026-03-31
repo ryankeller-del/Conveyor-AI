@@ -39,8 +39,12 @@ class DistillationLoop:
         rule_limit: int = 6,
         breadcrumb_limit: int = 5,
     ) -> CompactionResult:
-        failures = self._read_jsonl_rows(failure_library_path, max_rows=120)
-        progress_lines = self._read_lines(progress_path, max_lines=160)
+        failures = self._prefilter_failure_rows(
+            self._read_jsonl_rows(failure_library_path, max_rows=120)
+        )
+        progress_lines = self._prefilter_context_lines(
+            self._read_lines(progress_path, max_lines=160)
+        )
 
         rules = self._extract_rules(failures, progress_lines, limit=rule_limit)
         breadcrumbs = self._build_breadcrumbs(rules, progress_lines, limit=breadcrumb_limit)
@@ -66,8 +70,8 @@ class DistillationLoop:
     ) -> List[str]:
         rule_candidates: List[str] = []
         for row in failures[-20:]:
-            error = str(row.get("error_message", "")).strip().replace("\n", " ")
-            fix = str(row.get("fix_summary", "")).strip().replace("\n", " ")
+            error = self._normalize_context_text(str(row.get("error_message", "")), 140)
+            fix = self._normalize_context_text(str(row.get("fix_summary", "")), 120)
             if not error:
                 continue
             if fix:
@@ -200,3 +204,70 @@ class DistillationLoop:
         with open(path, "r", encoding="utf-8") as handle:
             lines = [line.rstrip() for line in handle]
         return lines[-max_lines:]
+
+    def _prefilter_failure_rows(self, rows: List[Dict]) -> List[Dict]:
+        filtered: List[Dict] = []
+        seen = set()
+        for row in rows:
+            error = self._normalize_context_text(str(row.get("error_message", "")), 180)
+            fix = self._normalize_context_text(str(row.get("fix_summary", "")), 160)
+            if not error and not fix:
+                continue
+            key = re.sub(r"\W+", " ", f"{error}::{fix}".lower()).strip()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned = dict(row)
+            cleaned["error_message"] = error
+            cleaned["fix_summary"] = fix
+            filtered.append(cleaned)
+        return filtered
+
+    def _prefilter_context_lines(self, lines: List[str]) -> List[str]:
+        filtered: List[str] = []
+        seen = set()
+        for line in lines:
+            clean = self._normalize_context_text(line, 220)
+            if not clean:
+                continue
+            key = re.sub(r"\W+", " ", clean.lower()).strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            filtered.append(clean)
+        return filtered
+
+    def _normalize_context_text(self, text: str, max_chars: int) -> str:
+        clean = (text or "").strip().replace("\r", " ")
+        if not clean:
+            return ""
+        clean = re.sub(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\b", "", clean)
+        clean = re.sub(r"\b(?:INFO|DEBUG|WARNING|ERROR|CRITICAL)\b[:\s-]*", "", clean, flags=re.I)
+        clean = re.sub(r"https?://\S+", "<URL>", clean)
+        clean = re.sub(r"(?:[A-Za-z]:\\|/)(?:[^ \t\r\n\f\v<>'\"]+[\\/])*[^ \t\r\n\f\v<>'\"]+", "<PATH>", clean)
+        clean = re.sub(r"\s+", " ", clean).strip()
+        if not clean:
+            return ""
+        lowered = clean.lower()
+        noise_markers = [
+            "heartbeat tick",
+            "press ctrl+c",
+            "development server",
+            "running on all addresses",
+            "performing health checks",
+            "health check results",
+            "ollama check failed",
+            "peer check failed",
+            "required path exists",
+            "drive - total",
+            "this site can't be reached",
+            "no swarm events yet",
+            "status json",
+        ]
+        if any(marker in lowered for marker in noise_markers):
+            return ""
+        if lowered.startswith("git ") and ("for-each-ref" in lowered or "check-ignore" in lowered):
+            return ""
+        if len(clean) < 4:
+            return ""
+        return clean[: max(1, max_chars)]

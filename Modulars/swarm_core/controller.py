@@ -6,6 +6,7 @@ import re
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from queue import Empty, Queue
 from dataclasses import asdict
 from datetime import datetime
@@ -1234,6 +1235,7 @@ class SwarmController:
         status: Dict[str, object],
         conversation_context: str = "",
     ) -> str:
+        status_lines = self._chat_status_lines(mode, status)
         lines = [
             "You are LocalChatBot, the user's priority local assistant for this swarm.",
             "Return valid JSON only with keys: reply, background_instruction, swarm_health, mode.",
@@ -1244,15 +1246,7 @@ class SwarmController:
             "- architect: give a concise reply and a compact background instruction for the main swarm architect.",
             "- recap: summarize the recent conversation visible below, using only the provided transcript. Do not say you cannot access history; you can see the Recent conversation block.",
             "Swarm status:",
-            f"state={status.get('state', 'IDLE')}; phase={status.get('phase', 'PREPARING')}; ",
-            f"wave={status.get('wave_name', 'BASELINE')} ({status.get('wave_index', 0)}); ",
-            f"active_topology={', '.join(status.get('active_topology', []))}; ",
-            f"open_handoffs={status.get('open_handoff_count', 0)}; ",
-            f"guard_mode={status.get('guard_mode', 'NORMAL')}; ",
-            f"hallucination_confidence={status.get('hallucination_confidence', 1.0):.3f}; ",
-            f"local_api_inflight={status.get('local_api_inflight', 0)}; ",
-            f"queued_architect_instructions={status.get('queued_architect_instruction_count', 0)}; ",
-            f"latest_architect_instruction={status.get('latest_architect_instruction', '')}",
+            *status_lines,
             f"User message: {message_text.strip()}",
         ]
         if conversation_context.strip():
@@ -1263,6 +1257,34 @@ class SwarmController:
                 ]
             )
         return "\n".join(lines)
+
+    def _chat_status_lines(self, mode: str, status: Dict[str, object]) -> List[str]:
+        base = [
+            f"state={status.get('state', 'IDLE')}; phase={status.get('phase', 'PREPARING')}; ",
+            f"wave={status.get('wave_name', 'BASELINE')} ({status.get('wave_index', 0)}); ",
+        ]
+        if mode == "chat":
+            base.extend(
+                [
+                    f"background_queue={status.get('background_run_queue_depth', 0)}; ",
+                    f"local_api_inflight={status.get('local_api_inflight', 0)}; ",
+                    f"queued_architect_instructions={status.get('queued_architect_instruction_count', 0)}; ",
+                ]
+            )
+            return base
+
+        base.extend(
+            [
+                f"active_topology={', '.join(status.get('active_topology', []))}; ",
+                f"open_handoffs={status.get('open_handoff_count', 0)}; ",
+                f"guard_mode={status.get('guard_mode', 'NORMAL')}; ",
+                f"hallucination_confidence={status.get('hallucination_confidence', 1.0):.3f}; ",
+                f"local_api_inflight={status.get('local_api_inflight', 0)}; ",
+                f"queued_architect_instructions={status.get('queued_architect_instruction_count', 0)}; ",
+                f"latest_architect_instruction={status.get('latest_architect_instruction', '')}",
+            ]
+        )
+        return base
 
     def _parse_chat_response(
         self,
@@ -1694,26 +1716,35 @@ class SwarmController:
 
                     generated_code = self._implement(goal, test_specs, attempt, effective_config)
 
-                    guard_passed = True
                     if effective_config.hallucination_guard_enabled:
                         with self._lock:
                             self.snapshot.phase = ControllerPhase.HALLUCINATION_GUARD
                             self._save_state()
-                        guard_passed = self._run_hallucination_guard(
+                        guard_result, passed, judge_output = self._run_parallel_validations(
                             goal=goal,
                             generated_code=generated_code,
+                            test_specs=test_specs,
                             config=effective_config,
                             cycle_index=wave_idx,
                         )
+                        guard_passed = self._record_hallucination_guard_result(
+                            goal=goal,
+                            result=guard_result,
+                            config=effective_config,
+                            cycle_index=wave_idx,
+                        )
+                        with self._lock:
+                            self.snapshot.phase = ControllerPhase.JUDGE
+                            self._save_state()
+                        self._record_judge_result(passed, judge_output)
                         if not guard_passed:
                             failure_recurrence += 1
                             continue
-
-                    with self._lock:
-                        self.snapshot.phase = ControllerPhase.JUDGE
-                        self._save_state()
-
-                    passed, judge_output = self._judge(goal, test_specs, effective_config)
+                    else:
+                        with self._lock:
+                            self.snapshot.phase = ControllerPhase.JUDGE
+                            self._save_state()
+                        passed, judge_output = self._judge(goal, test_specs, effective_config)
                     if passed:
                         pass_count = len(test_specs)
                         self._resolve_current_unfinished_feature()
@@ -2121,18 +2152,24 @@ class SwarmController:
         return False
 
     def _judge(self, goal: TaskGoal, specs: List[TestSpec], config: RunConfig):
+        passed, output = self._evaluate_judge(specs, config)
+        self._record_judge_result(passed, output)
+        return passed, output
+
+    def _evaluate_judge(self, specs: List[TestSpec], config: RunConfig):
         tests_path = specs[0].path
-        passed, output = self.judge_bot.run_tests_with_command(
+        return self.judge_bot.run_tests_with_command(
             tests_path=tests_path,
             cwd=self.root_dir,
             command_template=config.test_command,
         )
+
+    def _record_judge_result(self, passed: bool, output: str) -> None:
         if self.artifacts:
             self.artifacts.append_event(
                 "judge_result",
                 {"passed": passed, "output_excerpt": output[:600]},
             )
-        return passed, output
 
     def _spawn_for_failure(self, goal: TaskGoal, judge_output: str, config: RunConfig) -> None:
         if self.snapshot.wave_index <= self.guard_spawn_pause_until_wave:
@@ -2564,7 +2601,11 @@ class SwarmController:
             target_file=goal.target_files[0],
             fix_summary=fix_list,
         )
-        guidance = self.failure_memory.format_guidance(goal.prompt, limit=1)
+        guidance = self.failure_memory.format_guidance(
+            goal.prompt,
+            limit=1,
+            failure_context=f"{judge_output}\n{fix_list}\n{self.last_failure_context}",
+        )
         self.last_failure_context = (
             f"failure={judge_output[:700]}\nfix={fix_list[:500]}\n"
             f"guidance={guidance[:500]}"
@@ -2649,6 +2690,7 @@ class SwarmController:
                 guidance = self.failure_memory.format_guidance(
                     working_prompt,
                     limit=config.failure_memory_limit,
+                    failure_context=self.last_failure_context,
                 )
                 if guidance:
                     support_notes.append(guidance)
@@ -2784,7 +2826,11 @@ class SwarmController:
         elif config.prompt_guard_retry_on_error:
             failure_context = self.last_failure_context
             if not failure_context and config.failure_memory_enabled:
-                similar = self.failure_memory.retrieve_similar(prompt, limit=2)
+                similar = self.failure_memory.retrieve_similar(
+                    prompt,
+                    limit=2,
+                    failure_context=self.last_failure_context,
+                )
                 if similar:
                     failure_context = "\n".join(
                         [
@@ -2848,13 +2894,35 @@ class SwarmController:
             if goal.target_files
             else self.root_dir
         )
-        result = self.hallucination_guard.evaluate(
+        result = self._evaluate_hallucination_guard(
             target_file=target_path,
             code=generated_code,
             prompt=goal.prompt,
             doc_grounding_enabled=config.doc_grounding_enabled,
         )
+        return self._record_hallucination_guard_result(goal, result, config, cycle_index)
 
+    def _evaluate_hallucination_guard(
+        self,
+        target_file: str,
+        code: str,
+        prompt: str,
+        doc_grounding_enabled: bool,
+    ):
+        return self.hallucination_guard.evaluate(
+            target_file=target_file,
+            code=code,
+            prompt=prompt,
+            doc_grounding_enabled=doc_grounding_enabled,
+        )
+
+    def _record_hallucination_guard_result(
+        self,
+        goal: TaskGoal,
+        result,
+        config: RunConfig,
+        cycle_index: int,
+    ) -> bool:
         with self._lock:
             self.snapshot.hallucination_confidence = result.confidence
             self.snapshot.hallucination_alert_count = len(result.alerts)
@@ -2908,6 +2976,36 @@ class SwarmController:
                 )
             return False
         return True
+
+    def _run_parallel_validations(
+        self,
+        goal: TaskGoal,
+        generated_code: str,
+        test_specs: List[TestSpec],
+        config: RunConfig,
+        cycle_index: int,
+    ):
+        target_path = (
+            os.path.join(self.root_dir, goal.target_files[0])
+            if goal.target_files
+            else self.root_dir
+        )
+        if not config.hallucination_guard_enabled:
+            passed, judge_output = self._evaluate_judge(test_specs, config)
+            return None, passed, judge_output
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            guard_future = executor.submit(
+                self._evaluate_hallucination_guard,
+                target_path,
+                generated_code,
+                goal.prompt,
+                config.doc_grounding_enabled,
+            )
+            judge_future = executor.submit(self._evaluate_judge, test_specs, config)
+            guard_result = guard_future.result()
+            passed, judge_output = judge_future.result()
+        return guard_result, passed, judge_output
 
     def _rotate_topology(self, config: RunConfig, wave_idx: int) -> None:
         window = max(1, config.topology_eval_window_cycles)

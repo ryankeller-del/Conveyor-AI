@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import heapq
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -72,6 +74,15 @@ class LocalCallLease:
     waited_seconds: float
     throttled: bool
     lane: str = "swarm"
+
+
+@dataclass(order=True)
+class _QueuedLocalCall:
+    priority: int
+    sequence: int
+    agent_name: str = field(compare=False)
+    task_family: str = field(compare=False)
+    lane: str = field(compare=False)
 
 
 @dataclass
@@ -1143,6 +1154,7 @@ class LocalCallGovernor:
         self.min_interval_seconds = max(0.0, float(min_interval_seconds))
         self.queue_limit = max(1, int(queue_limit))
         self.backoff_seconds = max(0.01, float(backoff_seconds))
+        self._sequence = itertools.count()
         self._inflight = 0
         self._last_call_at = 0.0
         self._throttle_hits = 0
@@ -1150,6 +1162,7 @@ class LocalCallGovernor:
         self._priority_waiting = 0
         self._swarm_waiting = 0
         self._last_lane = "swarm"
+        self._waiters: List[_QueuedLocalCall] = []
 
     def configure(
         self,
@@ -1169,57 +1182,60 @@ class LocalCallGovernor:
         lane = "user" if str(lane).strip().lower() in {"user", "chat", "priority"} else "swarm"
         waited = 0.0
         throttled = False
-        start = time.time()
+        sequence = next(self._sequence)
+        queued = _QueuedLocalCall(
+            priority=0 if lane == "user" else 1,
+            sequence=sequence,
+            agent_name=agent_name,
+            task_family=task_family,
+            lane=lane,
+        )
         with self._lock:
-            if lane == "user":
-                self._priority_waiting += 1
-            else:
-                self._swarm_waiting += 1
-            queue_depth = self._inflight
-            self._max_queue_depth = max(self._max_queue_depth, queue_depth)
-            if queue_depth >= self.queue_limit:
+            while lane != "user" and self._swarm_waiting >= self.queue_limit:
                 throttled = True
                 self._throttle_hits += 1
                 delay = self.backoff_seconds
                 self._lock.wait(timeout=delay)
                 waited += delay
-            while self._inflight >= self.max_inflight:
-                throttled = True
-                self._throttle_hits += 1
-                delay = max(self.backoff_seconds, self.min_interval_seconds)
-                self._lock.wait(timeout=delay)
-                waited += delay
-            elapsed = time.time() - self._last_call_at
-            if self._last_call_at and elapsed < self.min_interval_seconds:
-                throttled = True
-                self._throttle_hits += 1
-                delay = self.min_interval_seconds - elapsed
-                if delay > 0:
-                    self._lock.wait(timeout=delay)
-                    waited += delay
-            if lane != "user":
-                while self._priority_waiting > 0:
-                    throttled = True
-                    self._throttle_hits += 1
-                    delay = max(self.backoff_seconds, self.min_interval_seconds)
-                    self._lock.wait(timeout=delay)
-                    waited += delay
-            self._inflight += 1
-            self._max_queue_depth = max(self._max_queue_depth, self._inflight)
-            self._last_call_at = time.time()
-            self._last_lane = lane
+            heapq.heappush(self._waiters, queued)
             if lane == "user":
-                self._priority_waiting = max(0, self._priority_waiting - 1)
+                self._priority_waiting += 1
             else:
-                self._swarm_waiting = max(0, self._swarm_waiting - 1)
-            return LocalCallLease(
-                agent_name=agent_name,
-                task_family=task_family,
-                acquired_at=self._last_call_at,
-                waited_seconds=round(waited, 4),
-                throttled=throttled,
-                lane=lane,
-            )
+                self._swarm_waiting += 1
+            self._max_queue_depth = max(self._max_queue_depth, self._inflight + len(self._waiters))
+            self._lock.notify_all()
+            while True:
+                head = self._waiters[0] if self._waiters else None
+                elapsed = time.time() - self._last_call_at
+                interval_ready = not self._last_call_at or elapsed >= self.min_interval_seconds
+                if head is queued and self._inflight < self.max_inflight and interval_ready:
+                    heapq.heappop(self._waiters)
+                    if lane == "user":
+                        self._priority_waiting = max(0, self._priority_waiting - 1)
+                    else:
+                        self._swarm_waiting = max(0, self._swarm_waiting - 1)
+                    self._inflight += 1
+                    self._max_queue_depth = max(self._max_queue_depth, self._inflight + len(self._waiters))
+                    self._last_call_at = time.time()
+                    self._last_lane = lane
+                    return LocalCallLease(
+                        agent_name=agent_name,
+                        task_family=task_family,
+                        acquired_at=self._last_call_at,
+                        waited_seconds=round(waited, 4),
+                        throttled=throttled,
+                        lane=lane,
+                    )
+
+                throttled = True
+                self._throttle_hits += 1
+                delay = self.backoff_seconds
+                if self._inflight >= self.max_inflight:
+                    delay = max(delay, self.min_interval_seconds)
+                elif not interval_ready:
+                    delay = max(delay, self.min_interval_seconds - elapsed)
+                self._lock.wait(timeout=max(0.01, delay))
+                waited += max(0.01, delay)
 
     def release(self, lease: LocalCallLease) -> None:
         with self._lock:
@@ -1231,6 +1247,7 @@ class LocalCallGovernor:
         with self._lock:
             return {
                 "inflight": self._inflight,
+                "queue_depth": len(self._waiters) + self._inflight,
                 "throttle_hits": self._throttle_hits,
                 "max_queue_depth": self._max_queue_depth,
                 "user_waiting": self._priority_waiting,

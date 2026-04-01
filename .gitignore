@@ -11,6 +11,8 @@ swarm_runs/
 reports/
 Modulars/swarm_runs/
 Modulars/reports/
+Modulars_legacy/swarm_runs/
+Modulars_legacy/reports/
 .phoenix/
 *.db
 
@@ -26,3 +28,14 @@ __pycache__/
 
 # Chainlit auto-generated translations
 **/.chainlit/translations/
+
+# Frozen legacy (local archive only — replaced by conveyor_v2)
+Modulars_legacy/
+
+# Conveyor v2
+conveyor_v2/*.egg-info/
+conveyor_v2/build/
+conveyor_v2/dist/
+conveyor_v2/.pytest_cache/
+conveyor_v2/src/conveyor/__pycache__/
+conveyor_v2/src/conveyor/**/__pycache__/

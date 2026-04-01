@@ -1,0 +1,45 @@
+[project]
+name = "conveyor-v2"
+version = "0.1.0"
+description = "Replacement orchestrator for ConveyorAI — multi-agent swarm system"
+requires-python = ">=3.11"
+dependencies = [
+    "chainlit>=2.0",
+    "openai>=1.30",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pytest-asyncio>=0.23",
+    "black>=24.0",
+    "isort>=5.13",
+    "mypy>=1.8",
+]
+
+[project.scripts]
+conveyor = "conveyor.__main__:main"
+"conveyor-ui" = "conveyor.__main__:main_ui"
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra -q --strict-markers"
+testpaths = ["tests"]
+
+[tool.mypy]
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+
+[tool.black]
+line-length = 99
+
+[tool.isort]
+profile = "black"
